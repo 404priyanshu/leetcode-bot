@@ -31,6 +31,7 @@ PROFILE_DIR = BASE / "leetcode_profile"  # persistent login
 SOLVED_FILE = BASE / "solved.json"  # progress tracker
 LOG_FILE = BASE / "activity.log"
 TELEGRAM_FILE = BASE / "telegram.json"  # {"bot_token": ..., "chat_id": ...}
+STATE_FILE = BASE / "bot_state.json"  # persistent waits + API circuit breaker
 
 WALKCCC_URL = "https://walkccc.me/LeetCode/problems/{num}/"  # keyed by problem number
 LEETCODE = "https://leetcode.com"
@@ -41,6 +42,10 @@ MIN_GAP, MAX_GAP = 3, 12  # minutes between problems
 START_JITTER_HOURS = 3  # up to N hours random start offset (non-interactive only)
 SKIP_DAY_CHANCE = 0.05  # small chance of a light/skipped day
 LOOSE_DAY_CHANCE = 0.15  # small chance of a lazy 1-2 problem day
+BLOCKED_STATUSES = {403, 429}
+BREAKER_THRESHOLD = 3  # blocked responses within the rolling window
+BREAKER_WINDOW_SECONDS = 15 * 60
+BREAKER_COOLDOWN_SECONDS = 30 * 60
 # -------------------------------------------------------------------------
 
 DIFFICULTIES = ("easy", "medium", "hard")
@@ -102,6 +107,87 @@ def say(msg=""):
 def log(msg):
     with open(LOG_FILE, "a") as f:
         f.write(f"[{date.today()} {time.strftime('%H:%M:%S')}] {msg}\n")
+
+
+class CircuitBreakerOpen(RuntimeError):
+    """LeetCode requests are paused after repeated blocking responses."""
+
+
+def load_runtime_state():
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_runtime_state(state):
+    """Atomically save restart-sensitive timing state."""
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+    tmp.replace(STATE_FILE)
+
+
+def update_runtime_state(**changes):
+    state = load_runtime_state()
+    for key, value in changes.items():
+        if value is None:
+            state.pop(key, None)
+        else:
+            state[key] = value
+    save_runtime_state(state)
+
+
+def _state_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def ensure_api_circuit_closed(now=None):
+    now = time.time() if now is None else now
+    state = load_runtime_state()
+    open_until = _state_float(state.get("api_circuit_open_until"))
+    if open_until > now:
+        remaining = max(1, int((open_until - now + 59) // 60))
+        raise CircuitBreakerOpen(
+            f"API circuit breaker is open; retry in about {remaining} min"
+        )
+    if open_until:
+        update_runtime_state(api_circuit_open_until=None, blocked_responses=None)
+
+
+def record_api_status(status, url, now=None):
+    """Open the circuit after repeated 403/429 responses in a short window."""
+    if status not in BLOCKED_STATUSES:
+        return
+
+    now = time.time() if now is None else now
+    state = load_runtime_state()
+    timestamps = state.get("blocked_responses", [])
+    if not isinstance(timestamps, list):
+        timestamps = []
+    recent = []
+    for timestamp in timestamps:
+        parsed = _state_float(timestamp, default=-1)
+        if parsed >= 0 and 0 <= now - parsed <= BREAKER_WINDOW_SECONDS:
+            recent.append(parsed)
+    recent.append(now)
+    changes = {"blocked_responses": recent}
+    log(
+        f"API BLOCK {status} ({len(recent)}/{BREAKER_THRESHOLD}) on {url}"
+    )
+    if len(recent) >= BREAKER_THRESHOLD:
+        changes["api_circuit_open_until"] = now + BREAKER_COOLDOWN_SECONDS
+    update_runtime_state(**changes)
+    if len(recent) >= BREAKER_THRESHOLD:
+        raise CircuitBreakerOpen(
+            f"stopping after {len(recent)} blocked API responses "
+            f"within {BREAKER_WINDOW_SECONDS // 60} min"
+        )
 
 
 # ---------------- arrow-key menu (stdlib only) -----------------------------
@@ -230,10 +316,20 @@ def get_csrf(page):
     return m.group(1)
 
 
-def api_fetch(page, url, method="GET", payload=None, csrf="", referrer=LEETCODE, _retried=False):
+def api_fetch(
+    page,
+    url,
+    method="GET",
+    payload=None,
+    csrf="",
+    referrer=LEETCODE,
+    _retried=False,
+):
+    ensure_api_circuit_closed()
     body = json.dumps(payload) if payload is not None else None
     res = page.evaluate(FETCH_JS, [url, method, body, csrf, referrer])
     status, text = res["status"], res["text"]
+    record_api_status(status, url)
     # LeetCode's Cloudflare occasionally answers the in-page fetch with its
     # "Just a moment..." challenge page. Back off, reload the page so the
     # browser can clear the challenge, then retry the call once.
@@ -618,6 +714,60 @@ def pick_count(cfg):
     return random.randint(MIN_PROBLEMS, MAX_PROBLEMS)
 
 
+def wait_before_next_question(cfg):
+    """Apply the configured gap at the boundary between question attempts."""
+    if cfg["timing"] != "human":
+        return
+
+    gap = random.uniform(MIN_GAP, MAX_GAP)
+    deadline = time.time() + gap * 60
+    update_runtime_state(next_question_at=deadline)
+    say(
+        dim(
+            f"  waiting {gap:.0f} min before the next question"
+            " (Ctrl+C to skip) ..."
+        )
+    )
+    log(f"Waiting {gap:.1f} min before next question.")
+    try:
+        time.sleep(gap * 60)
+    except KeyboardInterrupt:
+        say(dim("  wait skipped"))
+        log("Wait skipped by user.")
+    finally:
+        update_runtime_state(next_question_at=None)
+
+
+def wait_for_saved_question_slot(cfg):
+    """Resume an unfinished human-mode gap after a process restart."""
+    if cfg["timing"] != "human":
+        if "next_question_at" in load_runtime_state():
+            update_runtime_state(next_question_at=None)
+        return
+
+    deadline = _state_float(load_runtime_state().get("next_question_at"))
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        if deadline:
+            update_runtime_state(next_question_at=None)
+        return
+
+    say(
+        dim(
+            f"  resuming saved wait: {remaining / 60:.0f} min remaining"
+            " (Ctrl+C to skip) ..."
+        )
+    )
+    log(f"Resuming saved wait ({remaining / 60:.1f} min remaining).")
+    try:
+        time.sleep(remaining)
+    except KeyboardInterrupt:
+        say(dim("  wait skipped"))
+        log("Saved wait skipped by user.")
+    finally:
+        update_runtime_state(next_question_at=None)
+
+
 def run_session(ctx, cfg):
     t0 = time.time()
     page = ctx.new_page()
@@ -654,7 +804,12 @@ def run_session(ctx, cfg):
 
     n = pick_count(cfg)
     say(bold(f"Today's target: {n} problem{'s' if n != 1 else ''}"))
-    log(f"Solving {n} problems, {len(pool)} candidates.")
+    timing_label = "3-12 min gaps" if cfg["timing"] == "human" else "no waits"
+    say(dim(f"Timing: {cfg['timing']} ({timing_label})"))
+    log(
+        f"Solving {n} problems, {len(pool)} candidates; "
+        f"timing={cfg['timing']} ({timing_label})."
+    )
 
     # Pull from the pool until n are accepted; problems missing from
     # walkccc.me or failing the run are skipped in favor of the next one.
@@ -662,6 +817,7 @@ def run_session(ctx, cfg):
     accepted = []
     try:
         while done < n and pool and attempts < n + 10:
+            wait_for_saved_question_slot(cfg)
             q = pool.pop(0)
             slug, name = q["titleSlug"], q["title"]
             attempts += 1
@@ -691,6 +847,8 @@ def run_session(ctx, cfg):
                                 f" ({run.get('status_msg', 'unknown')}) - next problem"
                             )
                         )
+                        if pool and attempts < n + 10:
+                            wait_before_next_question(cfg)
                         continue
                     say(green("  ✓ example tests passed"))
                 else:
@@ -708,22 +866,12 @@ def run_session(ctx, cfg):
                         green(f"  ✓ ACCEPTED — {name}")
                         + (dim(f" ({rt})") if rt else "")
                     )
-                    if done < n and cfg["timing"] == "human":
-                        gap = random.uniform(MIN_GAP, MAX_GAP)
-                        say(
-                            dim(
-                                f"  waiting {gap:.0f} min before the next one"
-                                " (Ctrl+C to skip) ..."
-                            )
-                        )
-                        try:
-                            time.sleep(gap * 60)
-                        except KeyboardInterrupt:
-                            say(dim("  wait skipped"))
                 else:
                     submit_failed += 1
                     log(f"SUBMIT FAILED ({res.get('status_msg')}): {name}")
                     say(red(f"  ✗ submit failed ({res.get('status_msg', 'unknown')})"))
+            except CircuitBreakerOpen:
+                raise
             except NoSolutionYet as e:
                 no_solution += 1
                 log(f"NO SOLUTION YET, skipping: {name}")
@@ -732,6 +880,11 @@ def run_session(ctx, cfg):
                 errors += 1
                 log(f"ERROR on {name}: {e}")
                 say(red(f"  ✗ error: {e}"))
+
+            # Delay at the actual question boundary, regardless of whether the
+            # attempt was accepted, rejected, unavailable, or errored.
+            if done < n and pool and attempts < n + 10:
+                wait_before_next_question(cfg)
     except KeyboardInterrupt:
         say()
         say(yellow("interrupted - stopping early"))
@@ -827,11 +980,18 @@ def main():
     with sync_playwright() as p:
         ctx = _launch(p, headless=True)
         try:
-            if not cfg["interactive"] and cfg["timing"] == "human":
-                jitter = random.uniform(0, START_JITTER_HOURS * 3600)
-                say(dim(f"start jitter: sleeping {jitter / 60:.0f} min ..."))
-                time.sleep(jitter)
-            run_session(ctx, cfg)
+            try:
+                ensure_api_circuit_closed()
+                if not cfg["interactive"] and cfg["timing"] == "human":
+                    jitter = random.uniform(0, START_JITTER_HOURS * 3600)
+                    say(dim(f"start jitter: sleeping {jitter / 60:.0f} min ..."))
+                    time.sleep(jitter)
+                run_session(ctx, cfg)
+            except CircuitBreakerOpen as e:
+                message = f"API circuit breaker: {e}"
+                say(red(f"✗ {message}"))
+                log(message)
+                send_telegram(f"LeetCode bot stopped: {message}")
         finally:
             ctx.close()
 
