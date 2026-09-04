@@ -5,3 +5,7 @@ telegram.json
 activity.log
 solved.json
 bot_state.json
+attempts.db
+attempts.db-shm
+attempts.db-wal
+leetcode_report.xlsx

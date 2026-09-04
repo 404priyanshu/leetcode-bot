@@ -22,7 +22,7 @@ From this folder, create a virtual environment and install Playwright:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install playwright
+python -m pip install -r requirements.txt
 python -m playwright install chrome
 ```
 
@@ -79,6 +79,7 @@ to the next candidate. Use `--instant` to disable all of these waits.
 | --- | --- |
 | `--setup` | Open Chrome and save a LeetCode login |
 | `--setup-telegram` | Configure optional Telegram notifications |
+| `--export-report` | Rebuild the Excel report from the structured history |
 | `--difficulty easy` | Use easy problems; also accepts `medium`, `hard`, `all`, or a comma-separated list |
 | `--count N` | Try to get exactly `N` accepted submissions |
 | `--instant` | Skip the startup delay and gaps between problems |
@@ -113,11 +114,41 @@ Environment variables take priority over `telegram.json`.
 - `leetcode_profile/` — saved browser login; keep it private
 - `solved.json` — problem IDs successfully submitted by the bot
 - `activity.log` — run history and errors
+- `attempts.db` — durable SQLite history for every session and problem attempt
+- `leetcode_report.xlsx` — color-coded report rebuilt after each session
 - `bot_state.json` — saved wait times and temporary API cooldown state
 - `telegram.json` — Telegram credentials, if configured; keep it private
 
 Do not commit `leetcode_profile/` or `telegram.json`, because they contain
 private login information or credentials.
+
+## History and Excel report
+
+Every selected problem is recorded in `attempts.db` with its problem details,
+stage reached, outcome, exact failure reason, status, runtime, submission ID,
+and duration. Each run also gets a session record with its target and stop
+reason. Existing IDs in `solved.json` are preserved separately as historical
+IDs because their original dates and details are not known.
+
+After every run, the bot regenerates `leetcode_report.xlsx` with four sheets:
+
+- `Summary` — totals by outcome with a color legend
+- `Attempts` — one filterable row per selected problem
+- `Sessions` — one row per run with result counts
+- `Historical solved IDs` — older IDs imported from `solved.json`
+
+Accepted rows are green. Missing solutions are blue, test failures yellow,
+submission failures orange, rate limits purple, errors red, and interruptions
+gray. To rebuild the workbook without running the solver:
+
+```bash
+python leetcode_bot.py --export-report
+```
+
+SQLite is the source of truth, so no history is lost if the Excel file is open
+or temporarily cannot be replaced. Close the workbook and run
+`--export-report` again. If the bot process crashes, its unfinished session and
+attempt are marked as interrupted when the next run starts.
 
 ## Troubleshooting
 
@@ -127,7 +158,7 @@ Activate the virtual environment and install the dependency:
 
 ```bash
 source .venv/bin/activate
-python -m pip install playwright
+python -m pip install -r requirements.txt
 ```
 
 **Chrome does not open or Playwright cannot find it**
@@ -152,5 +183,7 @@ cooldown instead of repeatedly restarting it.
 
 **Skip a wait or stop a run**
 
-During a between-problem wait, press `s` to skip that wait. Press Ctrl+C at
-any time to stop the entire session cleanly.
+Interactive waits show a progress bar and an `MM:SS` countdown that updates
+once per second. Press `s` to skip that wait, or press Ctrl+C at any time to
+stop the entire session cleanly. Scheduled runs do not print the live countdown
+because it would add hundreds of nearly identical lines to their logs.
