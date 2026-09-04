@@ -113,6 +113,24 @@ class CircuitBreakerOpen(RuntimeError):
     """LeetCode requests are paused after repeated blocking responses."""
 
 
+class BrowserSessionClosed(RuntimeError):
+    """The Playwright page, browser context, or driver is no longer usable."""
+
+
+_CLOSED_BROWSER_MESSAGES = (
+    "target page, context or browser has been closed",
+    "connection closed while reading from the driver",
+    "browser has been closed",
+    "browser closed",
+)
+
+
+def browser_session_closed(error):
+    """Return whether a Playwright error means this run cannot continue."""
+    message = str(error).lower()
+    return any(marker in message for marker in _CLOSED_BROWSER_MESSAGES)
+
+
 def load_runtime_state():
     if not STATE_FILE.exists():
         return {}
@@ -340,6 +358,16 @@ def api_fetch(
         page.goto(referrer, wait_until="domcontentloaded")
         page.wait_for_timeout(10000)  # let the challenge auto-solve
         return api_fetch(page, url, method, payload, csrf, referrer, _retried=True)
+    if status in BLOCKED_STATUSES:
+        # Moving straight to a different problem still uses the same blocked
+        # LeetCode session. Stop this run and persist a real cooldown instead.
+        update_runtime_state(
+            api_circuit_open_until=time.time() + BREAKER_COOLDOWN_SECONDS
+        )
+        raise CircuitBreakerOpen(
+            f"LeetCode returned {status}; retry in about "
+            f"{BREAKER_COOLDOWN_SECONDS // 60} min"
+        )
     return status, text
 
 
@@ -714,6 +742,26 @@ def pick_count(cfg):
     return random.randint(MIN_PROBLEMS, MAX_PROBLEMS)
 
 
+def _wait_until(deadline):
+    """Wait until a timestamp; in a terminal, allow `s` to skip the wait."""
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        return False
+    if not sys.stdin.isatty():
+        time.sleep(remaining)
+        return False
+
+    with _cbreak():
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            if _fd_select([sys.stdin], [], [], min(1, remaining))[0]:
+                key = os.read(sys.stdin.fileno(), 1).lower()
+                if key == b"s":
+                    return True
+
+
 def wait_before_next_question(cfg):
     """Apply the configured gap at the boundary between question attempts."""
     if cfg["timing"] != "human":
@@ -725,15 +773,14 @@ def wait_before_next_question(cfg):
     say(
         dim(
             f"  waiting {gap:.0f} min before the next question"
-            " (Ctrl+C to skip) ..."
+            " (s to skip · Ctrl+C to stop) ..."
         )
     )
     log(f"Waiting {gap:.1f} min before next question.")
     try:
-        time.sleep(gap * 60)
-    except KeyboardInterrupt:
-        say(dim("  wait skipped"))
-        log("Wait skipped by user.")
+        if _wait_until(deadline):
+            say(dim("  wait skipped"))
+            log("Wait skipped by user.")
     finally:
         update_runtime_state(next_question_at=None)
 
@@ -755,15 +802,14 @@ def wait_for_saved_question_slot(cfg):
     say(
         dim(
             f"  resuming saved wait: {remaining / 60:.0f} min remaining"
-            " (Ctrl+C to skip) ..."
+            " (s to skip · Ctrl+C to stop) ..."
         )
     )
     log(f"Resuming saved wait ({remaining / 60:.1f} min remaining).")
     try:
-        time.sleep(remaining)
-    except KeyboardInterrupt:
-        say(dim("  wait skipped"))
-        log("Saved wait skipped by user.")
+        if _wait_until(deadline):
+            say(dim("  wait skipped"))
+            log("Saved wait skipped by user.")
     finally:
         update_runtime_state(next_question_at=None)
 
@@ -821,6 +867,7 @@ def run_session(ctx, cfg):
             q = pool.pop(0)
             slug, name = q["titleSlug"], q["title"]
             attempts += 1
+            paced_attempt = False
             say()
             say(
                 bold(
@@ -837,6 +884,7 @@ def run_session(ctx, cfg):
                 qid, data_input = get_question_meta(page, slug)
                 if data_input:
                     say(dim("  running example tests ..."))
+                    paced_attempt = True
                     run = run_solution(page, csrf, slug, qid, code, data_input)
                     if not run.get("correct_answer"):
                         run_failed += 1
@@ -854,6 +902,7 @@ def run_session(ctx, cfg):
                 else:
                     say(yellow("  ! no example tests, submitting anyway"))
                 say(dim("  submitting ..."))
+                paced_attempt = True
                 res = submit_solution(page, csrf, slug, qid, code)
                 if res.get("status_code") == 10:  # 10 = Accepted
                     done += 1
@@ -877,17 +926,24 @@ def run_session(ctx, cfg):
                 log(f"NO SOLUTION YET, skipping: {name}")
                 say(yellow(f"  ! {e} - next problem"))
             except Exception as e:
+                if browser_session_closed(e):
+                    raise BrowserSessionClosed(str(e)) from e
                 errors += 1
                 log(f"ERROR on {name}: {e}")
                 say(red(f"  ✗ error: {e}"))
 
-            # Delay at the actual question boundary, regardless of whether the
-            # attempt was accepted, rejected, unavailable, or errored.
-            if done < n and pool and attempts < n + 10:
+            # Pace real test/submission traffic. Scrape failures and missing
+            # solutions can move directly to the next candidate.
+            if paced_attempt and done < n and pool and attempts < n + 10:
                 wait_before_next_question(cfg)
+    except BrowserSessionClosed as e:
+        errors += 1
+        say()
+        say(red("browser session closed - stopping this run"))
+        log(f"BROWSER SESSION CLOSED: {e}")
     except KeyboardInterrupt:
         say()
-        say(yellow("interrupted - stopping early"))
+        say(yellow("interrupted - stopping this run cleanly"))
 
     mins = (time.time() - t0) / 60
     say()

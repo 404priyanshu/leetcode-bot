@@ -69,8 +69,9 @@ python leetcode_bot.py --difficulty all --count 5 --no-menu
 ```
 
 Human-like timing is the default. In non-interactive mode it can wait up to
-three hours before starting, then waits 3–12 minutes between problem attempts.
-Use `--instant` to disable all of these waits.
+three hours before starting, then waits 3–12 minutes after a real test or
+submission attempt. Missing solutions and failures before testing move directly
+to the next candidate. Use `--instant` to disable all of these waits.
 
 ### Options
 
@@ -145,11 +146,11 @@ python leetcode_bot.py --setup
 
 **The API circuit breaker is open**
 
-LeetCode returned repeated `403` or `429` responses. The bot pauses requests
-for about 30 minutes. Wait for the cooldown instead of repeatedly restarting
-it.
+LeetCode returned a `403` or `429` response. After one retry for a Cloudflare
+challenge, the bot stops and pauses requests for about 30 minutes. Wait for the
+cooldown instead of repeatedly restarting it.
 
-**Stop a run**
+**Skip a wait or stop a run**
 
-Press Ctrl+C. During a between-problem wait, the first Ctrl+C skips that wait;
-press it again while the bot is working to stop the session.
+During a between-problem wait, press `s` to skip that wait. Press Ctrl+C at
+any time to stop the entire session cleanly.
