@@ -1,5 +1,6 @@
 venv/
 __pycache__/
 leetcode_profile/
+telegram.json
 activity.log
 solved.json
