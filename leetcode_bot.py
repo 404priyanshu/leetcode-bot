@@ -24,7 +24,7 @@ from datetime import date
 from pathlib import Path
 from select import select as _fd_select
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
 
 BASE = Path(__file__).parent
 PROFILE_DIR = BASE / "leetcode_profile"  # persistent login
@@ -230,10 +230,21 @@ def get_csrf(page):
     return m.group(1)
 
 
-def api_fetch(page, url, method="GET", payload=None, csrf="", referrer=LEETCODE):
+def api_fetch(page, url, method="GET", payload=None, csrf="", referrer=LEETCODE, _retried=False):
     body = json.dumps(payload) if payload is not None else None
     res = page.evaluate(FETCH_JS, [url, method, body, csrf, referrer])
-    return res["status"], res["text"]
+    status, text = res["status"], res["text"]
+    # LeetCode's Cloudflare occasionally answers the in-page fetch with its
+    # "Just a moment..." challenge page. Back off, reload the page so the
+    # browser can clear the challenge, then retry the call once.
+    if status == 403 and "Just a moment" in text and not _retried:
+        log(f"CLOUDFLARE CHALLENGE on {url}")
+        say(yellow("  ! Cloudflare challenge - backing off, then retrying ..."))
+        time.sleep(random.uniform(15, 30))
+        page.goto(referrer, wait_until="domcontentloaded")
+        page.wait_for_timeout(10000)  # let the challenge auto-solve
+        return api_fetch(page, url, method, payload, csrf, referrer, _retried=True)
+    return status, text
 
 
 def gql(page, query, variables=None):
@@ -427,10 +438,19 @@ def strip_comments(code):
         return code
 
 
+class NoSolutionYet(RuntimeError):
+    """walkccc.me hasn't published a solution for this problem yet."""
+
+
 def get_python_solution(page, num):
     """Scrape the Python solution from walkccc.me (keyed by problem number)."""
-    page.goto(WALKCCC_URL.format(num=num), wait_until="domcontentloaded")
-    page.wait_for_selector("pre code", timeout=10000)
+    res = page.goto(WALKCCC_URL.format(num=num), wait_until="domcontentloaded")
+    if res is not None and res.status == 404:
+        raise NoSolutionYet(f"no page for #{num} on walkccc.me yet")
+    try:
+        page.wait_for_selector("pre code", timeout=15000)
+    except PWTimeout:
+        raise NoSolutionYet("page has no code blocks yet (or was too slow)")
     blocks = page.locator("pre code").all_inner_texts()
     # Site now serves one plain code block per language; line-number gutters
     # appear as separate blocks containing only digits. Pick a Python block.
@@ -438,7 +458,7 @@ def get_python_solution(page, num):
     if not candidates:
         candidates = [b for b in blocks if "def " in b and "return" in b]
     if not candidates:
-        raise RuntimeError("no Python solution found on walkccc.me")
+        raise NoSolutionYet("no Python solution published yet")
     code = candidates[0].strip()
     cleaned = strip_comments(code)
     if cleaned != code:
@@ -638,7 +658,7 @@ def run_session(ctx, cfg):
 
     # Pull from the pool until n are accepted; problems missing from
     # walkccc.me or failing the run are skipped in favor of the next one.
-    done = run_failed = submit_failed = errors = attempts = 0
+    done = run_failed = submit_failed = errors = no_solution = attempts = 0
     accepted = []
     try:
         while done < n and pool and attempts < n + 10:
@@ -704,6 +724,10 @@ def run_session(ctx, cfg):
                     submit_failed += 1
                     log(f"SUBMIT FAILED ({res.get('status_msg')}): {name}")
                     say(red(f"  ✗ submit failed ({res.get('status_msg', 'unknown')})"))
+            except NoSolutionYet as e:
+                no_solution += 1
+                log(f"NO SOLUTION YET, skipping: {name}")
+                say(yellow(f"  ! {e} - next problem"))
             except Exception as e:
                 errors += 1
                 log(f"ERROR on {name}: {e}")
@@ -715,7 +739,10 @@ def run_session(ctx, cfg):
     mins = (time.time() - t0) / 60
     say()
     say(bold(f"Session done — {done}/{n} accepted"))
-    say(f"  run failed {run_failed} · submit failed {submit_failed} · errors {errors}")
+    say(
+        f"  run failed {run_failed} · submit failed {submit_failed}"
+        f" · no solution yet {no_solution} · errors {errors}"
+    )
     for name in accepted:
         say(f"  {green('✓')} {name}")
     say(dim(f"  {mins:.1f} min · progress in solved.json · details in activity.log"))
@@ -724,7 +751,8 @@ def run_session(ctx, cfg):
     log("Session done.")
     msg = [
         f"LeetCode bot: {done}/{n} accepted",
-        f"run failed {run_failed} · submit failed {submit_failed} · errors {errors}",
+        f"run failed {run_failed} · submit failed {submit_failed}"
+        f" · no solution yet {no_solution} · errors {errors}",
     ]
     msg += [f"- {name}" for name in accepted]
     msg.append(f"{mins:.0f} min total")
