@@ -1,2 +1,2 @@
-playwright
-openpyxl
+playwright==1.62.0
+openpyxl==3.1.5

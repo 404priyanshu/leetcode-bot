@@ -17,6 +17,7 @@ OUTCOME_COLORS = {
     "Submission failed": ("FCE4D6", "9C5700"),
     "Rate limited": ("E4DFEC", "5F497A"),
     "Browser error": ("F4CCCC", "9C0006"),
+    "Network error": ("F4CCCC", "9C0006"),
     "Error": ("F4CCCC", "9C0006"),
     "Interrupted": ("E7E6E6", "595959"),
     "In progress": ("E7E6E6", "595959"),
@@ -27,6 +28,7 @@ SESSION_COLORS = {
     "Partial": ("FFF2CC", "7F6000"),
     "Rate limited": ("E4DFEC", "5F497A"),
     "Browser error": ("F4CCCC", "9C0006"),
+    "Network error": ("F4CCCC", "9C0006"),
     "Failed": ("F4CCCC", "9C0006"),
     "Interrupted": ("E7E6E6", "595959"),
     "Running": ("E7E6E6", "595959"),
@@ -125,14 +127,17 @@ def import_historical_solved(db_path, problem_ids):
         conn.executemany(
             """
             INSERT OR IGNORE INTO historical_solved(problem_id, imported_at, source)
-            VALUES (?, ?, ?)
+            SELECT ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM attempts WHERE problem_id = ? AND outcome = 'Accepted'
+            )
             """,
-            rows,
+            [(*row, row[0]) for row in rows],
         )
 
 
-def start_session(db_path, difficulties, timing, target_count):
-    session_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+def recover_interrupted_sessions(db_path):
+    """Recover abandoned records only while the caller holds the run lock."""
     with _connect(db_path) as conn:
         recovered_at = now_iso()
         recovery_reason = "Previous process ended before this record was completed"
@@ -153,6 +158,11 @@ def start_session(db_path, difficulties, timing, target_count):
             """,
             (recovered_at, recovery_reason),
         )
+
+
+def start_session(db_path, difficulties, timing, target_count):
+    session_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    with _connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO sessions(
@@ -170,8 +180,40 @@ def start_session(db_path, difficulties, timing, target_count):
     return session_id
 
 
+def accepted_problem_ids(db_path):
+    with _connect(db_path) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT DISTINCT problem_id FROM attempts WHERE outcome = 'Accepted'"
+        )]
+
+
+def update_attempt_stage(db_path, attempt_id, stage):
+    with _connect(db_path) as conn:
+        conn.execute("UPDATE attempts SET stage = ? WHERE attempt_id = ?",
+                     (stage, attempt_id))
+
+
+def record_submission(db_path, attempt_id, submission_id):
+    """Keep the ID even if polling is interrupted or the network disappears."""
+    with _connect(db_path) as conn:
+        conn.execute("UPDATE attempts SET submission_id = ? WHERE attempt_id = ?",
+                     (str(submission_id), attempt_id))
+
+
 def finish_session(db_path, session_id, status, stop_reason=""):
     with _connect(db_path) as conn:
+        # Also cover interruption immediately after an attempt INSERT, before
+        # the caller received its ID. Never rewrite an already finished result.
+        outcome = status if status in OUTCOME_COLORS else "Error"
+        conn.execute(
+            """
+            UPDATE attempts SET ended_at = ?, outcome = ?, reason = ?
+            WHERE session_id = ? AND outcome = 'In progress'
+            """,
+            (now_iso(), outcome,
+             clean_reason(stop_reason or "Session ended before attempt was finalized"),
+             session_id),
+        )
         conn.execute(
             """
             UPDATE sessions
@@ -224,7 +266,8 @@ def finish_attempt(
             """
             UPDATE attempts
             SET ended_at = ?, stage = ?, outcome = ?, reason = ?,
-                status_message = ?, runtime = ?, submission_id = ?,
+                status_message = ?, runtime = ?,
+                submission_id = CASE WHEN ? = '' THEN submission_id ELSE ? END,
                 duration_seconds = ?
             WHERE attempt_id = ?
             """,
@@ -235,6 +278,7 @@ def finish_attempt(
                 clean_reason(reason),
                 clean_reason(status_message, limit=200),
                 str(runtime or ""),
+                str(submission_id or ""),
                 str(submission_id or ""),
                 round(duration, 3),
                 attempt_id,
@@ -332,6 +376,7 @@ def export_excel(db_path, report_path):
                 COALESCE(SUM(a.outcome = 'Submission failed'), 0) AS submit_failed,
                 COALESCE(SUM(a.outcome = 'Rate limited'), 0) AS rate_limited,
                 COALESCE(SUM(a.outcome = 'Browser error'), 0) AS browser_error,
+                COALESCE(SUM(a.outcome = 'Network error'), 0) AS network_error,
                 COALESCE(SUM(a.outcome = 'Error'), 0) AS errors,
                 COALESCE(SUM(a.outcome = 'Interrupted'), 0) AS interrupted
             FROM sessions s
@@ -389,7 +434,7 @@ def export_excel(db_path, report_path):
     ):
         summary.cell(row_number, 4, label)
         summary.cell(row_number, 5, value).number_format = "#,##0"
-    for row in summary.iter_rows(min_row=5, max_row=13, min_col=1, max_col=5):
+    for row in summary.iter_rows(min_row=5, max_row=4 + len(summary_outcomes), min_col=1, max_col=5):
         for cell in row:
             if cell.value is not None and cell.column != 1:
                 cell.font = Font(name="Arial", size=10, color="222222")
@@ -452,7 +497,7 @@ def export_excel(db_path, report_path):
     session_headers = [
         "Session ID", "Started", "Ended", "Difficulties", "Timing", "Target",
         "Accepted", "No solution", "Test failed", "Submission failed",
-        "Rate limited", "Browser errors", "Errors", "Interrupted", "Status",
+        "Rate limited", "Browser errors", "Network errors", "Errors", "Interrupted", "Status",
         "Stop reason",
     ]
     sessions_ws.append(session_headers)
@@ -471,6 +516,7 @@ def export_excel(db_path, report_path):
                 row["submit_failed"],
                 row["rate_limited"],
                 row["browser_error"],
+                row["network_error"],
                 row["errors"],
                 row["interrupted"],
                 row["status"],
@@ -482,11 +528,11 @@ def export_excel(db_path, report_path):
         {
             "A": 25, "B": 20, "C": 20, "D": 18, "E": 12, "F": 10,
             "G": 11, "H": 13, "I": 12, "J": 18, "K": 14, "L": 15,
-            "M": 10, "N": 12, "O": 16, "P": 55,
+            "M": 15, "N": 10, "O": 12, "P": 16, "Q": 55,
         },
         date_columns=("B", "C"),
     )
-    _add_status_formatting(sessions_ws, "O", "P", SESSION_COLORS)
+    _add_status_formatting(sessions_ws, "P", "Q", SESSION_COLORS)
     _add_table(sessions_ws, "SessionsTable")
 
     historical_ws = wb.create_sheet("Historical solved IDs")

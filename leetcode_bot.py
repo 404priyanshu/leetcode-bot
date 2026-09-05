@@ -21,13 +21,18 @@ import time
 import tokenize
 import tty
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from select import select as _fd_select
 
-from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
+from playwright.sync_api import sync_playwright
 
 import reporting
+from runtime import (
+    AlreadyRunning, NetworkUnavailable, TransientReadError,
+    exclusive_run, is_network_error, retry_read,
+)
 
 BASE = Path(__file__).parent
 PROFILE_DIR = BASE / "leetcode_profile"  # persistent login
@@ -37,6 +42,7 @@ TELEGRAM_FILE = BASE / "telegram.json"  # {"bot_token": ..., "chat_id": ...}
 STATE_FILE = BASE / "bot_state.json"  # persistent waits + API circuit breaker
 HISTORY_DB = BASE / "attempts.db"  # durable structured history
 REPORT_FILE = BASE / "leetcode_report.xlsx"  # regenerated from HISTORY_DB
+LOCK_FILE = BASE / ".bot.lock"
 
 WALKCCC_URL = "https://walkccc.me/LeetCode/problems/{num}/"  # keyed by problem number
 LEETCODE = "https://leetcode.com"
@@ -60,17 +66,27 @@ DIFF_LABEL = {"easy": "Easy", "medium": "Medium", "hard": "Hard"}
 # so cookies + fingerprint are identical to normal browsing)
 FETCH_JS = """
 async ([url, method, body, csrf, referrer]) => {
-    const r = await fetch(url, {
-        method: method,
-        headers: {
-            'content-type': 'application/json',
-            'x-csrftoken': csrf,
-        },
-        body: body,
-        credentials: 'include',
-        referrer: referrer,
-    });
-    return {status: r.status, text: await r.text()};
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+        const r = await fetch(url, {
+            method: method,
+            headers: {
+                'content-type': 'application/json',
+                'x-csrftoken': csrf,
+            },
+            body: body,
+            credentials: 'include',
+            referrer: referrer,
+            signal: controller.signal,
+        });
+        return {status: r.status, text: await r.text()};
+    } catch (error) {
+        if (error.name === 'AbortError') throw new Error('Failed to fetch: timeout');
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 """
 
@@ -352,6 +368,30 @@ def get_csrf(page):
     return m.group(1)
 
 
+def network_notice(message):
+    say(yellow(f"  ! {message}"))
+    log(message)
+
+
+def navigate(page, url):
+    """Retry safe page loads without spending another problem attempt."""
+    def load():
+        response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if response is None:
+            raise TransientReadError(f"No HTTP response from {url}")
+        if url.startswith(LEETCODE + "/") or url == LEETCODE:
+            record_api_status(response.status, url)
+            if response.status in BLOCKED_STATUSES:
+                update_runtime_state(
+                    api_circuit_open_until=time.time() + BREAKER_COOLDOWN_SECONDS
+                )
+                raise CircuitBreakerOpen(f"LeetCode returned {response.status}")
+        if response.status in (408, 429) or response.status >= 500:
+            raise TransientReadError(f"HTTP {response.status} from {url}")
+        return response
+    return retry_read(load, f"Loading {url}", network_notice)
+
+
 def api_fetch(
     page,
     url,
@@ -360,10 +400,36 @@ def api_fetch(
     csrf="",
     referrer=LEETCODE,
     _retried=False,
+    retry_safe=False,
 ):
     ensure_api_circuit_closed()
     body = json.dumps(payload) if payload is not None else None
-    res = page.evaluate(FETCH_JS, [url, method, body, csrf, referrer])
+    def fetch():
+        res = page.evaluate(FETCH_JS, [url, method, body, csrf, referrer])
+        if (method == "GET" or retry_safe) and (
+            res["status"] == 408 or res["status"] >= 500
+        ):
+            raise TransientReadError(f"HTTP {res['status']} from {url}")
+        return res
+
+    if method == "GET" or retry_safe:
+        res = retry_read(fetch, f"Reading {url}", network_notice)
+    else:
+        try:
+            res = fetch()
+        except Exception as error:
+            if not is_network_error(error):
+                raise
+            raise NetworkUnavailable(
+                f"Connection lost during {method} {url}. The request may have "
+                "reached LeetCode; it was not resent. Check submission history "
+                "before running again."
+            ) from error
+        if res["status"] == 408 or res["status"] >= 500:
+            raise NetworkUnavailable(
+                f"HTTP {res['status']} during {method} {url}; request was not "
+                "resent. Check submission history before running again."
+            )
     status, text = res["status"], res["text"]
     record_api_status(status, url)
     # LeetCode's Cloudflare occasionally answers the in-page fetch with its
@@ -373,9 +439,10 @@ def api_fetch(
         log(f"CLOUDFLARE CHALLENGE on {url}")
         say(yellow("  ! Cloudflare challenge - backing off, then retrying ..."))
         time.sleep(random.uniform(15, 30))
-        page.goto(referrer, wait_until="domcontentloaded")
+        navigate(page, referrer)
         page.wait_for_timeout(10000)  # let the challenge auto-solve
-        return api_fetch(page, url, method, payload, csrf, referrer, _retried=True)
+        return api_fetch(page, url, method, payload, csrf, referrer,
+                         _retried=True, retry_safe=retry_safe)
     if status in BLOCKED_STATUSES:
         # Moving straight to a different problem still uses the same blocked
         # LeetCode session. Stop this run and persist a real cooldown instead.
@@ -395,10 +462,21 @@ def gql(page, query, variables=None):
         f"{LEETCODE}/graphql",
         "POST",
         {"query": query, "variables": variables or {}},
+        retry_safe=True,
     )
     if status >= 400:
         raise RuntimeError(f"GraphQL error {status}: {text[:200]}")
-    return json.loads(text)
+    data = json.loads(text)
+    if data.get("errors"):
+        raise RuntimeError(f"GraphQL errors: {reporting.clean_reason(data['errors'])}")
+    return data
+
+
+def verify_login(page):
+    data = gql(page, "query { userStatus { isSignedIn } }")
+    if not data.get("data", {}).get("userStatus", {}).get("isSignedIn"):
+        raise RuntimeError("LeetCode session expired; run --setup to log in again")
+    return get_csrf(page)
 
 
 def get_problem_list(page):
@@ -460,7 +538,10 @@ def poll_check(page, check_id):
             if d.get("state") == "SUCCESS":
                 return d
         time.sleep(2)
-    return {}
+    raise NetworkUnavailable(
+        f"Timed out waiting for LeetCode result {check_id}. Request was not "
+        "resent; check submission history before running again."
+    )
 
 
 def run_solution(page, csrf, slug, qid, code, data_input):
@@ -482,7 +563,7 @@ def run_solution(page, csrf, slug, qid, code, data_input):
     return poll_check(page, json.loads(text)["interpret_id"])
 
 
-def submit_solution(page, csrf, slug, qid, code):
+def submit_solution(page, csrf, slug, qid, code, on_submitted=None):
     status, text = api_fetch(
         page,
         f"{LEETCODE}/problems/{slug}/submit/",
@@ -494,6 +575,8 @@ def submit_solution(page, csrf, slug, qid, code):
     if status >= 400:
         raise RuntimeError(f"submit failed {status}: {text[:200]}")
     submission_id = json.loads(text)["submission_id"]
+    if on_submitted is not None:
+        on_submitted(submission_id)
     result = poll_check(page, submission_id)
     result.setdefault("submission_id", submission_id)
     return result
@@ -589,26 +672,43 @@ class NoSolutionYet(RuntimeError):
 
 def get_python_solution(page, num):
     """Scrape the Python solution from walkccc.me (keyed by problem number)."""
-    res = page.goto(WALKCCC_URL.format(num=num), wait_until="domcontentloaded")
-    if res is not None and res.status == 404:
+    res = navigate(page, WALKCCC_URL.format(num=num))
+    if res.status == 404:
         raise NoSolutionYet(f"no page for #{num} on walkccc.me yet")
-    try:
-        page.wait_for_selector("pre code", timeout=15000)
-    except PWTimeout:
-        raise NoSolutionYet("page has no code blocks yet (or was too slow)")
-    blocks = page.locator("pre code").all_inner_texts()
-    # Site now serves one plain code block per language; line-number gutters
-    # appear as separate blocks containing only digits. Pick a Python block.
-    candidates = [b for b in blocks if "class Solution" in b and "def " in b]
-    if not candidates:
-        candidates = [b for b in blocks if "def " in b and "return" in b]
-    if not candidates:
-        raise NoSolutionYet("no Python solution published yet")
-    code = candidates[0].strip()
+    if res.status >= 400:
+        raise NetworkUnavailable(f"Solution source returned HTTP {res.status}")
+    retry_read(
+        lambda: page.wait_for_selector("pre code", state="attached", timeout=15000),
+        f"Loading code blocks for #{num}", network_notice,
+    )
+    # textContent preserves line breaks and includes inactive language tabs.
+    blocks = page.locator("pre code").all_text_contents()
+    code = extract_python_solution(blocks)
     cleaned = strip_comments(code)
     if cleaned != code:
         say(dim("  stripped comments/docstrings from the snippet"))
     return cleaned
+
+
+def extract_python_solution(blocks):
+    candidates = []
+    for block in blocks:
+        code = block.strip()
+        if not re.search(r"\b(?:async\s+)?def\s+\w+\s*\(", code):
+            continue
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue
+        if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   for node in ast.walk(tree)):
+            continue
+        priority = 0 if any(isinstance(node, ast.ClassDef) and node.name == "Solution"
+                            for node in tree.body) else 1
+        candidates.append((priority, code))
+    if not candidates:
+        raise NoSolutionYet("page loaded, but contains no usable Python solution")
+    return min(candidates, key=lambda candidate: candidate[0])[1]
 
 
 # ---------------- browser + interactive menu ------------------------------
@@ -654,10 +754,10 @@ def telegram_config():
 
 def send_telegram(text):
     """Send a message; returns False (quietly) if not configured."""
-    token, chat = telegram_config()
-    if not token or not chat:
-        return False
     try:
+        token, chat = telegram_config()
+        if not token or not chat:
+            return False
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage",
             data=json.dumps({"chat_id": chat, "text": text}).encode(),
@@ -745,15 +845,29 @@ def run_menu(cfg):
 
 
 def parse_difficulty(spec):
-    spec = (spec or "easy").lower()
+    spec = spec.strip().lower()
     if spec == "all":
         return DIFFICULTIES
-    picked = tuple(d for d in spec.replace(" ", "").split(",") if d in DIFFICULTIES)
-    return picked or ("easy",)
+    picked = tuple(d.strip() for d in spec.split(","))
+    if not picked or any(d not in DIFFICULTIES for d in picked):
+        raise argparse.ArgumentTypeError(
+            "difficulty must be easy, medium, hard, all, or a comma-separated list"
+        )
+    return tuple(dict.fromkeys(picked))
+
+
+def positive_count(value):
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("count must be a positive integer") from error
+    if count <= 0:
+        raise argparse.ArgumentTypeError("count must be a positive integer")
+    return count
 
 
 def pick_count(cfg):
-    if cfg["count"]:
+    if cfg["count"] is not None:
         return cfg["count"]
     r = random.random()
     if r < SKIP_DAY_CHANCE:
@@ -838,12 +952,10 @@ def wait_before_next_question(cfg):
         )
     )
     log(f"Waiting {gap:.1f} min before next question.")
-    try:
-        if _wait_until(deadline):
-            say(dim("  wait skipped"))
-            log("Wait skipped by user.")
-    finally:
-        update_runtime_state(next_question_at=None)
+    if _wait_until(deadline):
+        say(dim("  wait skipped"))
+        log("Wait skipped by user.")
+    update_runtime_state(next_question_at=None)
 
 
 def wait_for_saved_question_slot(cfg):
@@ -866,266 +978,261 @@ def wait_for_saved_question_slot(cfg):
         )
     )
     log(f"Resuming saved wait ({remaining / 60:.1f} min remaining).")
-    try:
-        if _wait_until(deadline):
-            say(dim("  wait skipped"))
-            log("Saved wait skipped by user.")
-    finally:
-        update_runtime_state(next_question_at=None)
+    if _wait_until(deadline):
+        say(dim("  wait skipped"))
+        log("Saved wait skipped by user.")
+    update_runtime_state(next_question_at=None)
 
 
-def run_session(ctx, cfg):
-    t0 = time.time()
+@dataclass
+class SessionResult:
+    target: int
+    done: int = 0
+    run_failed: int = 0
+    submit_failed: int = 0
+    errors: int = 0
+    no_solution: int = 0
+    accepted: list = field(default_factory=list)
+    status: str = "Completed"
+    reason: str = ""
+
+
+def run_session(ctx, cfg, session_id, result):
     page = ctx.new_page()
+    source_page = ctx.new_page()
     say(dim(f"opening {LEETCODE} ..."))
-    page.goto(LEETCODE, wait_until="domcontentloaded")
-    page.wait_for_timeout(3000)
-    try:
-        csrf = get_csrf(page)
-    except RuntimeError as e:
-        say(red(f"✗ {e}"))
-        say(f"  run `{sys.argv[0]} --setup` (or pick 'Log in' in the menu) first.")
-        send_telegram(
-            "LeetCode bot: could not log in today (session expired?). "
-            "Run --setup again to refresh the login."
-        )
-        return
+    navigate(page, LEETCODE)
+    csrf = verify_login(page)
     say(green("✓ logged in"))
 
     solved = load_solved()
     reporting.import_historical_solved(HISTORY_DB, solved)
+    # SQLite can recover an accepted ID if the process died before JSON was saved.
+    solved = sorted(set(solved) | set(reporting.accepted_problem_ids(HISTORY_DB)))
     want = {d.upper() for d in cfg["difficulties"]}
     say(dim(f"fetching problem list ({'/'.join(cfg['difficulties'])}) ..."))
-    pool = [
-        q
-        for q in get_problem_list(page)
-        if q["difficulty"].upper() in want and q["frontendQuestionId"] not in solved
-    ]
+    pool = [q for q in get_problem_list(page)
+            if q["difficulty"].upper() in want
+            and str(q["frontendQuestionId"]) not in solved]
     say(f"  {len(pool)} problems to pick from · {len(solved)} already solved")
-    if not pool:
-        say(yellow("nothing left to solve"))
-        log("Nothing left to solve.")
-        refresh_excel_report()
-        send_telegram("LeetCode bot: nothing left to solve (all caught up).")
-        return
     random.shuffle(pool)
-
-    n = pick_count(cfg)
+    n = result.target
     say(bold(f"Today's target: {n} problem{'s' if n != 1 else ''}"))
-    timing_label = "3-12 min gaps" if cfg["timing"] == "human" else "no waits"
-    say(dim(f"Timing: {cfg['timing']} ({timing_label})"))
-    log(
-        f"Solving {n} problems, {len(pool)} candidates; "
-        f"timing={cfg['timing']} ({timing_label})."
-    )
-
-    # Pull from the pool until n are accepted; problems missing from
-    # walkccc.me or failing the run are skipped in favor of the next one.
-    done = run_failed = submit_failed = errors = no_solution = attempts = 0
-    accepted = []
-    session_id = reporting.start_session(
-        HISTORY_DB, cfg["difficulties"], cfg["timing"], n
-    )
-    session_status = "Completed"
-    session_reason = ""
-    current_attempt_id = None
-    current_attempt_started = None
+    log(f"Solving {n} problems, {len(pool)} candidates; timing={cfg['timing']}.")
+    attempts = 0
+    current_attempt_id = current_attempt_started = None
     current_stage = "Selected"
+
+    def stage(value):
+        nonlocal current_stage
+        current_stage = value
+        reporting.update_attempt_stage(HISTORY_DB, current_attempt_id, value)
 
     def finish_current(outcome, reason="", status_message="", runtime="", submission_id=""):
         nonlocal current_attempt_id, current_attempt_started
         if current_attempt_id is None:
             return
         reporting.finish_attempt(
-            HISTORY_DB,
-            current_attempt_id,
-            current_attempt_started,
-            current_stage,
-            outcome,
-            reason=reason,
-            status_message=status_message,
-            runtime=runtime,
-            submission_id=submission_id,
+            HISTORY_DB, current_attempt_id, current_attempt_started,
+            current_stage, outcome, reason=reason, status_message=status_message,
+            runtime=runtime, submission_id=submission_id,
         )
-        current_attempt_id = None
-        current_attempt_started = None
+        current_attempt_id = current_attempt_started = None
 
-    try:
-        while done < n and pool and attempts < n + 10:
-            wait_for_saved_question_slot(cfg)
-            q = pool.pop(0)
-            slug, name = q["titleSlug"], q["title"]
-            attempts += 1
-            paced_attempt = False
-            current_stage = "Solution fetch"
-            current_attempt_id, current_attempt_started = reporting.start_attempt(
-                HISTORY_DB, session_id, q
-            )
+    while result.done < n and pool and attempts < n + 10:
+        wait_for_saved_question_slot(cfg)
+        q = pool.pop()
+        slug, name = q["titleSlug"], q["title"]
+        attempts += 1
+        paced_attempt = False
+        current_attempt_id, current_attempt_started = reporting.start_attempt(
+            HISTORY_DB, session_id, q
+        )
+        try:
+            stage("Solution fetch")
             say()
-            say(
-                bold(
-                    f"[{done + 1}/{n}] #{q['frontendQuestionId']} {name}"
-                    f" · {q['difficulty'].title()}"
-                )
-            )
-            try:
-                say(dim("  fetching solution from walkccc.me ..."))
-                code = get_python_solution(page, q["frontendQuestionId"])
-                # back to leetcode origin for API calls
-                current_stage = "Problem metadata"
-                page.goto(f"{LEETCODE}/problems/{slug}/", wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)
-                qid, data_input = get_question_meta(page, slug)
-                if data_input:
-                    say(dim("  running example tests ..."))
-                    paced_attempt = True
-                    current_stage = "Example tests"
-                    run = run_solution(page, csrf, slug, qid, code, data_input)
-                    if not run.get("correct_answer"):
-                        run_failed += 1
-                        status_message = run.get("status_msg", "unknown")
-                        finish_current(
-                            "Test failed",
-                            reason=status_message,
-                            status_message=status_message,
-                        )
-                        log(f"RUN FAILED ({status_message}), skipping: {name}")
-                        say(
-                            red(
-                                f"  ✗ example tests failed"
-                                f" ({status_message}) - next problem"
-                            )
-                        )
-                        if pool and attempts < n + 10:
-                            wait_before_next_question(cfg)
-                        continue
-                    say(green("  ✓ example tests passed"))
+            say(bold(f"[{result.done + 1}/{n}] #{q['frontendQuestionId']} {name}"
+                     f" · {q['difficulty'].title()}"))
+            say(dim("  fetching solution from walkccc.me ..."))
+            code = get_python_solution(source_page, q["frontendQuestionId"])
+            stage("Problem metadata")
+            navigate(page, f"{LEETCODE}/problems/{slug}/")
+            csrf = get_csrf(page)
+            qid, data_input = get_question_meta(page, slug)
+            tests_passed = True
+            if data_input:
+                say(dim("  running example tests ..."))
+                paced_attempt = True
+                stage("Example tests")
+                run = run_solution(page, csrf, slug, qid, code, data_input)
+                tests_passed = bool(run.get("correct_answer"))
+                if not tests_passed:
+                    result.run_failed += 1
+                    status_message = run.get("status_msg", "unknown")
+                    finish_current("Test failed", reason=status_message,
+                                   status_message=status_message)
+                    log(f"RUN FAILED ({status_message}), skipping: {name}")
+                    say(red(f"  ✗ example tests failed ({status_message}) - next problem"))
                 else:
-                    say(yellow("  ! no example tests, submitting anyway"))
+                    say(green("  ✓ example tests passed"))
+            else:
+                say(yellow("  ! no example tests, submitting anyway"))
+
+            if tests_passed:
                 say(dim("  submitting ..."))
                 paced_attempt = True
-                current_stage = "Submission"
-                res = submit_solution(page, csrf, slug, qid, code)
-                if res.get("status_code") == 10:  # 10 = Accepted
-                    done += 1
-                    rt = res.get("status_runtime") or ""
-                    finish_current(
-                        "Accepted",
-                        status_message=res.get("status_msg", "Accepted"),
-                        runtime=rt,
-                        submission_id=res.get("submission_id", ""),
-                    )
-                    solved.append(q["frontendQuestionId"])
+                stage("Submission")
+                res = submit_solution(
+                    page, csrf, slug, qid, code,
+                    on_submitted=lambda submission_id: reporting.record_submission(
+                        HISTORY_DB, current_attempt_id, submission_id
+                    ),
+                )
+                status_message = res.get("status_msg", "unknown")
+                rt = res.get("status_runtime") or ""
+                submission_id = res.get("submission_id", "")
+                if res.get("status_code") == 10:
+                    finish_current("Accepted", status_message=status_message,
+                                   runtime=rt, submission_id=submission_id)
+                    result.done += 1
+                    result.accepted.append(name)
+                    solved.append(str(q["frontendQuestionId"]))
                     save_solved(solved)
-                    accepted.append(name)
-                    log(f"ACCEPTED ({done}/{n}): {name} [{q['difficulty']}]")
-                    say(
-                        green(f"  ✓ ACCEPTED — {name}")
-                        + (dim(f" ({rt})") if rt else "")
-                    )
+                    log(f"ACCEPTED ({result.done}/{n}): {name} [{q['difficulty']}]")
+                    say(green(f"  ✓ ACCEPTED — {name}") + (dim(f" ({rt})") if rt else ""))
                 else:
-                    submit_failed += 1
-                    status_message = res.get("status_msg", "unknown")
-                    finish_current(
-                        "Submission failed",
-                        reason=status_message,
-                        status_message=status_message,
-                        runtime=res.get("status_runtime", ""),
-                        submission_id=res.get("submission_id", ""),
-                    )
+                    result.submit_failed += 1
+                    finish_current("Submission failed", reason=status_message,
+                                   status_message=status_message, runtime=rt,
+                                   submission_id=submission_id)
                     log(f"SUBMIT FAILED ({status_message}): {name}")
                     say(red(f"  ✗ submit failed ({status_message})"))
-            except CircuitBreakerOpen as e:
-                finish_current("Rate limited", reason=e)
+        except KeyboardInterrupt:
+            finish_current("Interrupted", reason="Stopped by user")
+            raise
+        except CircuitBreakerOpen as error:
+            finish_current("Rate limited", reason=error)
+            raise
+        except NetworkUnavailable as error:
+            finish_current("Network error", reason=error)
+            raise
+        except NoSolutionYet as error:
+            result.no_solution += 1
+            finish_current("No solution", reason=error)
+            log(f"NO SOLUTION YET, skipping: {name}: {error}")
+            say(yellow(f"  ! {error} - next problem"))
+        except Exception as error:
+            if browser_session_closed(error):
+                finish_current("Browser error", reason=error)
+                raise BrowserSessionClosed(str(error)) from error
+            if is_network_error(error):
+                finish_current("Network error", reason=error)
+                raise NetworkUnavailable(str(error)) from error
+            # Persistence failures after recording a result are fatal, not a
+            # second, contradictory outcome for the accepted submission.
+            if current_attempt_id is None:
                 raise
-            except NoSolutionYet as e:
-                no_solution += 1
-                finish_current("No solution", reason=e)
-                log(f"NO SOLUTION YET, skipping: {name}: {e}")
-                say(yellow(f"  ! {e} - next problem"))
-            except Exception as e:
-                if browser_session_closed(e):
-                    finish_current("Browser error", reason=e)
-                    raise BrowserSessionClosed(str(e)) from e
-                if current_stage == "Example tests":
-                    outcome = "Test failed"
-                    run_failed += 1
-                elif current_stage == "Submission":
-                    outcome = "Submission failed"
-                    submit_failed += 1
-                else:
-                    outcome = "Error"
-                    errors += 1
-                finish_current(outcome, reason=e)
-                log(f"{outcome.upper()} on {name}: {e}")
-                say(red(f"  ✗ {outcome.lower()}: {e}"))
+            if current_stage == "Example tests":
+                outcome = "Test failed"
+                result.run_failed += 1
+            elif current_stage == "Submission":
+                outcome = "Submission failed"
+                result.submit_failed += 1
+            else:
+                outcome = "Error"
+                result.errors += 1
+            finish_current(outcome, reason=error)
+            log(f"{outcome.upper()} on {name}: {error}")
+            say(red(f"  ✗ {outcome.lower()}: {error}"))
 
-            # Pace real test/submission traffic. Scrape failures and missing
-            # solutions can move directly to the next candidate.
-            if paced_attempt and done < n and pool and attempts < n + 10:
-                wait_before_next_question(cfg)
-        if done < n:
-            session_status = "Partial"
-            session_reason = f"Only solved {done}/{n} before candidates or attempts ended"
-    except CircuitBreakerOpen as e:
-        session_status = "Rate limited"
-        session_reason = str(e)
-        raise
-    except BrowserSessionClosed as e:
-        errors += 1
-        session_status = "Browser error"
-        session_reason = str(e)
-        say()
-        say(red("browser session closed - stopping this run"))
-        log(f"BROWSER SESSION CLOSED: {e}")
+        if paced_attempt and result.done < n and pool and attempts < n + 10:
+            wait_before_next_question(cfg)
+
+    if result.done < n:
+        result.status = "Partial"
+        result.reason = (f"Only solved {result.done}/{n}: "
+                         + ("candidate pool exhausted" if not pool else "attempt limit reached"))
+
+
+def execute_session(cfg):
+    """Own the entire run lifecycle, including startup failures and cleanup."""
+    t0 = time.monotonic()
+    result = SessionResult(target=pick_count(cfg))
+    reporting.recover_interrupted_sessions(HISTORY_DB)
+    session_id = reporting.start_session(
+        HISTORY_DB, cfg["difficulties"], cfg["timing"], result.target
+    )
+    try:
+        ensure_api_circuit_closed()
+        if not cfg["interactive"] and cfg["timing"] == "human":
+            jitter = random.uniform(0, START_JITTER_HOURS * 3600)
+            say(dim(f"start jitter: sleeping {jitter / 60:.0f} min ..."))
+            _wait_until(time.time() + jitter)
+        with sync_playwright() as p:
+            ctx = _launch(p, headless=True)
+            try:
+                run_session(ctx, cfg, session_id, result)
+            finally:
+                try:
+                    ctx.close()
+                except Exception as error:
+                    # Closing an already dead browser must not mask its cause.
+                    log(f"BROWSER CLEANUP ERROR: {error}")
     except KeyboardInterrupt:
-        finish_current("Interrupted", reason="Stopped by user")
-        session_status = "Interrupted"
-        session_reason = "Stopped by user"
-        say()
-        say(yellow("interrupted - stopping this run cleanly"))
+        result.status, result.reason = "Interrupted", "Stopped by user"
+    except CircuitBreakerOpen as error:
+        result.status, result.reason = "Rate limited", str(error)
+    except NetworkUnavailable as error:
+        result.errors += 1
+        result.status, result.reason = "Network error", str(error)
+    except Exception as error:
+        result.errors += 1
+        result.status = "Browser error" if (
+            isinstance(error, BrowserSessionClosed) or browser_session_closed(error)
+        ) else "Failed"
+        result.reason = str(error)
     finally:
-        reporting.finish_session(
-            HISTORY_DB, session_id, session_status, session_reason
-        )
+        reporting.finish_session(HISTORY_DB, session_id, result.status, result.reason)
         refresh_excel_report()
 
-    mins = (time.time() - t0) / 60
+    mins = (time.monotonic() - t0) / 60
     say()
-    say(bold(f"Session done — {done}/{n} accepted"))
-    say(
-        f"  run failed {run_failed} · submit failed {submit_failed}"
-        f" · no solution yet {no_solution} · errors {errors}"
-    )
-    for name in accepted:
+    say(bold(f"Session done — {result.done}/{result.target} accepted · {result.status}"))
+    if result.reason:
+        say(yellow(f"  {reporting.clean_reason(result.reason)}"))
+        log(f"{result.status}: {result.reason}")
+    counts = (f"run failed {result.run_failed} · submit failed {result.submit_failed}"
+              f" · no solution yet {result.no_solution} · errors {result.errors}")
+    say(f"  {counts}")
+    for name in result.accepted:
         say(f"  {green('✓')} {name}")
-    say(
-        dim(
-            f"  {mins:.1f} min · progress in solved.json"
-            " · report in leetcode_report.xlsx"
-        )
-    )
-    if done < n:
-        log(f"Only solved {done}/{n}.")
+    say(dim(f"  {mins:.1f} min · progress in solved.json · report in leetcode_report.xlsx"))
     log("Session done.")
-    msg = [
-        f"LeetCode bot: {done}/{n} accepted",
-        f"run failed {run_failed} · submit failed {submit_failed}"
-        f" · no solution yet {no_solution} · errors {errors}",
-    ]
-    msg += [f"- {name}" for name in accepted]
+    msg = [f"LeetCode bot: {result.done}/{result.target} accepted · {result.status}", counts]
+    if result.reason:
+        msg.append(reporting.clean_reason(result.reason))
+    msg += [f"- {name}" for name in result.accepted]
     msg.append(f"{mins:.0f} min total")
     send_telegram("\n".join(msg))
+    return 0 if result.status == "Completed" else (130 if result.status == "Interrupted" else 1)
 
 
 def load_solved():
     if SOLVED_FILE.exists():
-        return json.loads(SOLVED_FILE.read_text())
+        data = json.loads(SOLVED_FILE.read_text())
+        if not isinstance(data, list) or any(
+            not isinstance(value, (str, int)) or isinstance(value, bool)
+            for value in data
+        ):
+            raise ValueError("solved.json must contain a list of problem IDs")
+        return sorted({str(value) for value in data})
     return []
 
 
 def save_solved(skus):
-    SOLVED_FILE.write_text(json.dumps(sorted(set(skus)), indent=1))
+    temporary = SOLVED_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(sorted({str(sku) for sku in skus}), indent=1))
+    temporary.replace(SOLVED_FILE)
 
 
 def main():
@@ -1149,9 +1256,10 @@ def main():
         help="rebuild leetcode_report.xlsx from the structured history",
     )
     ap.add_argument("--instant", action="store_true", help="skip all random waits")
-    ap.add_argument("--count", type=int, help="solve exactly N problems")
+    ap.add_argument("--count", type=positive_count, help="target N accepted submissions")
     ap.add_argument(
         "--difficulty",
+        type=parse_difficulty,
         default=None,
         help="easy, medium, hard, all, or comma list (default: easy)",
     )
@@ -1160,6 +1268,18 @@ def main():
     )
     args = ap.parse_args()
 
+    try:
+        with exclusive_run(LOCK_FILE):
+            return run_command(args)
+    except AlreadyRunning as error:
+        say(red(f"✗ {error}"))
+        return 1
+    except KeyboardInterrupt:
+        say(yellow("Stopped by user"))
+        return 130
+
+
+def run_command(args):
     if args.setup:
         setup_login()
         return
@@ -1168,11 +1288,10 @@ def main():
         return
     if args.export_report:
         reporting.import_historical_solved(HISTORY_DB, load_solved())
-        refresh_excel_report(announce=True)
-        return
+        return 0 if refresh_excel_report(announce=True) else 1
 
     cfg = {
-        "difficulties": parse_difficulty(args.difficulty),
+        "difficulties": args.difficulty or ("easy",),
         "count": args.count,
         "timing": "instant" if args.instant else "human",
         "interactive": False,
@@ -1192,24 +1311,8 @@ def main():
             say(dim("bye"))
             return
 
-    with sync_playwright() as p:
-        ctx = _launch(p, headless=True)
-        try:
-            try:
-                ensure_api_circuit_closed()
-                if not cfg["interactive"] and cfg["timing"] == "human":
-                    jitter = random.uniform(0, START_JITTER_HOURS * 3600)
-                    say(dim(f"start jitter: sleeping {jitter / 60:.0f} min ..."))
-                    time.sleep(jitter)
-                run_session(ctx, cfg)
-            except CircuitBreakerOpen as e:
-                message = f"API circuit breaker: {e}"
-                say(red(f"✗ {message}"))
-                log(message)
-                send_telegram(f"LeetCode bot stopped: {message}")
-        finally:
-            ctx.close()
+    return execute_session(cfg)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

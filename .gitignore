@@ -1,4 +1,8 @@
 venv/
+.venv/
+.bot.lock
+*.tmp
+.*.tmp.xlsx
 __pycache__/
 leetcode_profile/
 telegram.json
