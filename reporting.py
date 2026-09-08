@@ -352,7 +352,7 @@ def _add_status_formatting(ws, status_column, end_column, colors):
         )
 
 
-def export_excel(db_path, report_path):
+def export_excel(db_path, report_path, account_name=None):
     """Regenerate a styled Excel report from the SQLite source of truth."""
     try:
         from openpyxl import Workbook
@@ -398,8 +398,10 @@ def export_excel(db_path, report_path):
     wb = Workbook()
     summary = wb.active
     summary.title = "Summary"
+    if account_name:
+        wb.properties.title = f"LeetCode report — {account_name}"
     summary.sheet_view.showGridLines = False
-    summary["A1"] = "LeetCode bot report"
+    summary["A1"] = f"LeetCode bot report — {account_name}" if account_name else "LeetCode bot report"
     summary["A1"].font = Font(name="Arial", size=16, bold=True, color="1F1F1F")
     summary["A2"] = f"Generated {datetime.now():%Y-%m-%d %H:%M:%S}"
     summary["A2"].font = Font(name="Arial", size=10, italic=True, color="666666")

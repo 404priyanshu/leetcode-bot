@@ -152,3 +152,75 @@ can change, so live Windows testing with your account remains necessary.
 Implementation reference: [Patchright setup](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python).
 
 Power references: [powercfg options](https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options), [lid settings](https://learn.microsoft.com/en-us/windows-hardware/customize/power-settings/power-button-and-lid-settings).
+
+## Three accounts with Hermes
+
+The original account is named `default`. Existing commands, its Chrome profile,
+and its progress files stay in place; you do not need to log in again.
+
+Register each additional account from PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe leetcode_bot.py --account account2 --setup
+.\.venv\Scripts\python.exe leetcode_bot.py --account account3 --setup
+```
+
+Each new setup asks for the expected **LeetCode username** (not email or display
+name), then opens ordinary Chrome with a separate profile. Log into that account,
+complete verification manually, and close the profile's Chrome windows before
+continuing. Setup stores the expected username; the next automated run verifies
+it before selecting a question. A mismatch stops that account. Existing names
+cannot be rebound to different usernames: use a new name to avoid mixing history.
+For `default`, the first authenticated run records the username already logged in.
+
+Additional accounts live under `%LOCALAPPDATA%\leetcode-bot\accounts\NAME`:
+`profile`, `account.json`, `solved.json`, `bot_state.json`, `attempts.db`,
+`leetcode_report.xlsx`, `activity.log`, `logs`, and an individual process lock.
+The default identity record is `%LOCALAPPDATA%\leetcode-bot\default-account.json`.
+On macOS/Linux additional accounts live in the repository's `accounts/NAME`.
+Account directories and identity records are ignored by Git. No cookies, solved
+history, or cooldowns are copied between accounts. Account names use lowercase
+letters, digits, underscores and hyphens, start with a letter, and have at most
+32 characters; Windows reserved names are rejected.
+
+Have Hermes run this single command daily from the repository (or use absolute
+paths as shown earlier):
+
+```powershell
+.\.venv\Scripts\python.exe windows\run_daily.py --accounts default account2 account3 --count 1 --difficulty easy
+```
+
+The count applies **to each account**, so this targets three accepted solutions
+total. Each account independently chooses unsolved questions; accounts may choose
+the same question. Omit count/difficulty to keep one easy question per account.
+The runner validates all names up front, runs them sequentially, and applies
+startup jitter only to the first child. Other human-mode pauses remain enabled.
+`--instant` skips all waits. Separate account locks prevent profile collisions;
+a shared batch lock prevents overlapping Hermes wrappers.
+
+An expired login, username mismatch, or other account-specific failure allows
+the next account to run. Cloudflare/rate limiting, a network outage, interruption,
+or failed browser cleanup stops the batch and marks remaining accounts skipped.
+No failed submission is automatically replayed. Inspect logs before retrying.
+A forced stop may require manually closing the bot's Chrome windows.
+
+Per-account daily logs are in that account's `logs` directory. The default keeps
+its existing repository `logs/run-YYYY-MM-DD.log` location. A repository
+`logs/batch-YYYY-MM-DD.log` records each outcome and a completed/failed/skipped
+summary, also printed for Hermes. The wrapper returns 0 only if all accounts
+complete, 1 for failures/skips, or 130 for user interruption. Child exit 75 in a
+log means the batch must stop for a shared failure; this is an internal runner
+signal, not an instruction to retry. Ordinary direct bot commands retain their
+existing exit codes. Telegram uses the existing shared destination, with account
+names included in session messages.
+
+For an individual account or report export:
+
+```powershell
+.\.venv\Scripts\python.exe leetcode_bot.py --account account2 --no-menu --count 1 --instant
+.\.venv\Scripts\python.exe leetcode_bot.py --account account2 --export-report
+```
+
+The first command submits a solution. Confirm each expected username during
+setup before asking Hermes to run the whole batch. Reports remain separate and
+show the account name in the workbook heading.

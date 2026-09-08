@@ -183,9 +183,29 @@ class SessionTests(IsolatedBotTest):
         self.assertEqual([row['outcome'] for row in self.rows('attempts')], ['Accepted'])
         self.assertEqual(self.rows('sessions')[0]['status'], 'Failed')
 
+    def test_batch_child_reports_shared_failure_without_submission(self):
+        self.prepare_session()
+        self.cfg['batch_child'] = True
+        self.navigate.side_effect = NetworkUnavailable('offline')
+        self.assertEqual(self.execute(), 75)
+        self.submit.assert_not_called()
+
+    def test_batch_child_reports_cooldown_without_launch(self):
+        self.prepare_session()
+        self.cfg['batch_child'] = True
+        bot.update_runtime_state(api_circuit_open_until=bot.time.time() + 60)
+        self.assertEqual(self.execute(), 75)
+        self.launch.assert_not_called()
+
+    def test_batch_child_stops_after_cleanup_failure(self):
+        self.prepare_session()
+        self.cfg['batch_child'] = True
+        self.context.close.side_effect = RuntimeError('Chrome still running')
+        self.assertEqual(self.execute(), 75)
+
     def test_lock_rejection_does_not_start_or_recover_session(self):
         old = reporting.start_session(bot.HISTORY_DB, ('easy',), 'instant', 1)
-        with exclusive_run(bot.LOCK_FILE), patch.object(sys, 'argv', ['bot', '--instant']):
+        with exclusive_run(bot.LOCK_FILE), patch.object(sys, 'argv', ['bot', '--instant']), patch.object(bot, 'configure_account'), patch.object(bot.accounts, 'expected_username', return_value=None):
             self.assertEqual(bot.main(), 1)
         self.assertEqual(len(self.rows('sessions')), 1)
         self.assertEqual(self.rows('sessions')[0]['session_id'], old)

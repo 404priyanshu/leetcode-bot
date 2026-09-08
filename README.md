@@ -8,6 +8,16 @@ solutions through your logged-in LeetCode account.
 > that this use is acceptable to you and complies with LeetCode's rules before
 > running it. Automated activity can put an account at risk.
 
+For problems encountered during development, attempted fixes, and confirmed
+outcomes, see the [development issue log](docs/development-issues.md).
+
+## Multiple accounts
+
+Use `--account NAME --setup` to register additional logins. The existing account
+remains `default`, with its profile and history unchanged. Hermes can run all
+accounts sequentially with one command; see [three-account setup](windows/README.md#three-accounts-with-hermes).
+Each account has separate progress and an expected-username check.
+
 ## Requirements
 
 - Windows 11, macOS or Linux

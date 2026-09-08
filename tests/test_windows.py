@@ -41,8 +41,8 @@ class WindowsTests(unittest.TestCase):
             (root / 'leetcode_bot.py').write_text(
                 'import sys\nprint("\\u2713 fixture")\nprint("failure", file=sys.stderr)\nsys.exit(7)\n', encoding='utf-8')
             with patch.object(run_daily, 'ROOT', root), patch.object(run_daily.sys, 'argv', ['runner', '--instant']):
-                self.assertEqual(run_daily.main(), 7)
-            contents = next((root / 'logs').glob('*.log')).read_text(encoding='utf-8')
+                self.assertEqual(run_daily.main(), 1)
+            contents = next((root / 'logs').glob('run-*.log')).read_text(encoding='utf-8')
             self.assertIn('✓ fixture', contents)
             self.assertIn('failure', contents)
             self.assertIn('END exit_code=7', contents)

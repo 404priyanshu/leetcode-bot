@@ -16,6 +16,7 @@ import os
 import random
 import re
 import sys
+import signal
 import time
 import tokenize
 import urllib.request
@@ -32,6 +33,7 @@ else:
 from patchright.sync_api import sync_playwright
 
 import reporting
+import accounts
 from runtime import (
     AlreadyRunning, NetworkUnavailable, TransientReadError,
     exclusive_run, is_network_error, retry_read,
@@ -51,6 +53,21 @@ STATE_FILE = BASE / "bot_state.json"  # persistent waits + API circuit breaker
 HISTORY_DB = BASE / "attempts.db"  # durable structured history
 REPORT_FILE = BASE / "leetcode_report.xlsx"  # regenerated from HISTORY_DB
 LOCK_FILE = PROFILE_DIR.parent / ".leetcode-bot.lock" if os.name == "nt" else BASE / ".bot.lock"
+
+ACCOUNT_NAME = "default"
+
+
+def configure_account(name):
+    global ACCOUNT_NAME, PROFILE_DIR, SOLVED_FILE, LOG_FILE, STATE_FILE
+    global HISTORY_DB, REPORT_FILE, LOCK_FILE
+    selected = accounts.paths(name)
+    ACCOUNT_NAME = name
+    PROFILE_DIR, LOCK_FILE = selected["profile"], selected["lock"]
+    data = selected["data"]
+    SOLVED_FILE, LOG_FILE = data / "solved.json", data / "activity.log"
+    STATE_FILE, HISTORY_DB = data / "bot_state.json", data / "attempts.db"
+    REPORT_FILE = data / "leetcode_report.xlsx"
+
 
 WALKCCC_URL = "https://walkccc.me/LeetCode/problems/{num}/"  # keyed by problem number
 LEETCODE = "https://leetcode.com"
@@ -130,18 +147,18 @@ def cyan(t):
 
 
 def say(msg=""):
-    print(msg, flush=True)
+    print(f"[{ACCOUNT_NAME}] {msg}", flush=True)
 
 
 def log(msg):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{date.today()} {time.strftime('%H:%M:%S')}] {msg}\n")
+        f.write(f"[{ACCOUNT_NAME}] [{date.today()} {time.strftime('%H:%M:%S')}] {msg}\n")
 
 
 def refresh_excel_report(announce=False):
     """Rebuild the readable workbook without risking the solver session."""
     try:
-        path = reporting.export_excel(HISTORY_DB, REPORT_FILE)
+        path = reporting.export_excel(HISTORY_DB, REPORT_FILE, account_name=ACCOUNT_NAME)
         if announce:
             say(green(f"✓ report updated: {path.name}"))
         return True
@@ -532,9 +549,10 @@ def gql(page, query, variables=None):
 
 
 def verify_login(page):
-    data = gql(page, "query { userStatus { isSignedIn } }")
+    data = gql(page, "query { userStatus { isSignedIn username } }")
     if not data.get("data", {}).get("userStatus", {}).get("isSignedIn"):
         raise RuntimeError("LeetCode session expired; run --setup to log in again")
+    accounts.check_identity(ACCOUNT_NAME, data["data"]["userStatus"].get("username"))
     return get_csrf(page)
 
 
@@ -1234,6 +1252,7 @@ def run_session(ctx, cfg, session_id, result):
 def execute_session(cfg):
     """Own the entire run lifecycle, including startup failures and cleanup."""
     t0 = time.monotonic()
+    cleanup_failed = False
     result = SessionResult(target=pick_count(cfg))
     reporting.recover_interrupted_sessions(HISTORY_DB)
     session_id = reporting.start_session(
@@ -1241,7 +1260,7 @@ def execute_session(cfg):
     )
     try:
         ensure_api_circuit_closed()
-        if not cfg["interactive"] and cfg["timing"] == "human":
+        if not cfg["interactive"] and cfg["timing"] == "human" and not cfg.get("skip_start_jitter", False):
             jitter = random.uniform(0, START_JITTER_HOURS * 3600)
             say(dim(f"start jitter: sleeping {jitter / 60:.0f} min ..."))
             _wait_until(time.time() + jitter)
@@ -1254,6 +1273,7 @@ def execute_session(cfg):
                     ctx.close()
                 except Exception as error:
                     # Closing an already dead browser must not mask its cause.
+                    cleanup_failed = True
                     log(f"BROWSER CLEANUP ERROR: {error}")
     except KeyboardInterrupt:
         result.status, result.reason = "Interrupted", "Stopped by user"
@@ -1285,12 +1305,14 @@ def execute_session(cfg):
         say(f"  {green('✓')} {name}")
     say(dim(f"  {mins:.1f} min · progress in solved.json · report in leetcode_report.xlsx"))
     log("Session done.")
-    msg = [f"LeetCode bot: {result.done}/{result.target} accepted · {result.status}", counts]
+    msg = [f"LeetCode bot [{ACCOUNT_NAME}]: {result.done}/{result.target} accepted · {result.status}", counts]
     if result.reason:
         msg.append(reporting.clean_reason(result.reason))
     msg += [f"- {name}" for name in result.accepted]
     msg.append(f"{mins:.0f} min total")
     send_telegram("\n".join(msg))
+    if cfg.get("batch_child") and (cleanup_failed or result.status in ("Rate limited", "Network error")):
+        return 75
     return 0 if result.status == "Completed" else (130 if result.status == "Interrupted" else 1)
 
 
@@ -1313,6 +1335,10 @@ def save_solved(skus):
 
 
 def main():
+    if os.name == "nt":
+        def interrupt(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGBREAK, interrupt)
     ap = argparse.ArgumentParser(
         description="Auto-solve LeetCode problems (scrapes walkccc.me, "
         "submits via your saved login)."
@@ -1345,14 +1371,23 @@ def main():
     )
     ap.add_argument("--visible-browser", action="store_true",
                     help="keep the headed Chrome window on screen on Windows")
+    ap.add_argument("--account", default="default", help="named account (default: existing account)")
+    ap.add_argument("--skip-start-jitter", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--batch-child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     try:
+        configure_account(args.account)
+        if not args.setup:
+            accounts.expected_username(args.account)
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_run(LOCK_FILE):
             return run_command(args)
-    except AlreadyRunning as error:
+    except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:
         say(red(f"✗ {error}"))
+        return 1
+    except EOFError:
+        say(red("✗ Setup needs a terminal to read the expected username."))
         return 1
     except KeyboardInterrupt:
         say(yellow("Stopped by user"))
@@ -1361,6 +1396,12 @@ def main():
 
 def run_command(args):
     if args.setup:
+        if ACCOUNT_NAME != "default":
+            existing = accounts.expected_username(ACCOUNT_NAME) if accounts.paths(ACCOUNT_NAME)["identity"].exists() else None
+            if existing is None:
+                accounts.register(ACCOUNT_NAME, input("Expected LeetCode username for this account: "))
+            else:
+                say(f"Log in as {existing}; other usernames will be rejected.")
         setup_login()
         return
     if args.setup_telegram:
@@ -1376,6 +1417,8 @@ def run_command(args):
         "timing": "instant" if args.instant else "human",
         "interactive": False,
         "visible_browser": getattr(args, "visible_browser", False),
+        "skip_start_jitter": getattr(args, "skip_start_jitter", False),
+        "batch_child": getattr(args, "batch_child", False),
     }
 
     # Bare run in a terminal opens the menu; any run flags go straight to work.

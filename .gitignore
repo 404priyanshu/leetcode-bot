@@ -15,3 +15,7 @@ attempts.db-wal
 leetcode_report.xlsx
 
 logs/
+
+accounts/
+default-account.json
+.batch.lock
