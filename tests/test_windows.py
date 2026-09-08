@@ -47,3 +47,32 @@ class WindowsTests(unittest.TestCase):
             self.assertIn('failure', contents)
             self.assertIn('END exit_code=7', contents)
             self.assertTrue(all(line.startswith('[') for line in contents.splitlines()))
+
+
+class ManualLoginTests(unittest.TestCase):
+    def test_windows_setup_does_not_start_automation(self):
+        with patch.object(bot, 'os', SimpleNamespace(name='nt')), \
+                patch('windows.login.manual_login') as login, \
+                patch.object(bot, 'sync_playwright') as automation:
+            bot.setup_login()
+            login.assert_called_once_with(bot.PROFILE_DIR, bot.say)
+            automation.assert_not_called()
+
+    def test_manual_login_uses_profile_and_waits_for_browser(self):
+        from windows import login
+        with tempfile.TemporaryDirectory(prefix='login test ') as directory:
+            profile = Path(directory) / 'profile'
+            with patch.object(login, 'find_chrome', return_value=Path(directory) / 'chrome.exe'), \
+                    patch.object(login.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run:
+                announce = Mock()
+                login.manual_login(profile, announce)
+            command = run.call_args.args[0]
+            self.assertIn(f'--user-data-dir={profile}', command)
+            self.assertFalse(any('remote-debugging' in arg for arg in command))
+            self.assertIn('Login has not been verified', announce.call_args.args[0])
+
+    def test_missing_chrome_provides_actionable_error(self):
+        from windows import login
+        with patch.dict(login.os.environ, {}, clear=True), patch.object(login.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, 'Install Chrome'):
+                login.find_chrome()

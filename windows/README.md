@@ -22,8 +22,11 @@
    .\.venv\Scripts\python.exe leetcode_bot.py --setup
    ```
 
-   Log in and complete any verification in the visible Chrome window, then
-   press Enter in PowerShell. Login is verified before setup reports success.
+   Setup opens ordinary installed Chrome without Patchright or a debugging
+   connection. Log in and complete verification manually, then close all windows
+   of this bot profile. Keep the command running until Chrome closes, so the
+   profile lock stays held. Setup retains the profile but does not verify login;
+   the next bot run checks it before selecting any problems.
    Cookies live in `%LOCALAPPDATA%\leetcode-bot\profile`, independent of the
    checkout and current working directory. This is a dedicated profile; do not
    share it with another Chrome instance, delete it between runs, or sync it
@@ -114,6 +117,22 @@
    ```powershell
    Unregister-ScheduledTask -TaskName 'LeetCode Bot Daily' -Confirm:$false
    ```
+
+## When Windows signup/login verification fails
+
+Run `--setup` from PowerShell in your signed-in Windows desktop. The setup flow
+opens the login page for your existing account; it does not create an account.
+Do not launch a daily run while this Chrome window is open.
+
+If verification still fails in this ordinary Chrome window, check whether it
+also fails in Chrome opened from the Start menu. Update Chrome, confirm that
+JavaScript is enabled and extensions/network filters are not blocking challenge
+resources, and record the displayed error code and Ray ID. If ordinary browsing
+also fails, contact LeetCode support with those details; changing the bot alone
+may not fix it. See [Cloudflare's troubleshooting guide](https://developers.cloudflare.com/cloudflare-challenges/troubleshooting/challenge-solve-issues/).
+
+Manual login is not a promise of automatic verification on later bot runs.
+Cloudflare [does not support automation frameworks for production challenges](https://developers.cloudflare.com/cloudflare-challenges/reference/supported-browsers/).
 
 ## Verification and API behavior
 

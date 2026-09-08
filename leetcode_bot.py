@@ -791,6 +791,10 @@ def _launch(p, offscreen=False):
 
 
 def setup_login():
+    if os.name == "nt":
+        from windows.login import manual_login
+        manual_login(PROFILE_DIR, say)
+        return
     with sync_playwright() as p:
         ctx = _launch(p)
         try:
