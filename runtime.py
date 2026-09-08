@@ -1,11 +1,15 @@
 """Process ownership and bounded retries for read-only browser operations."""
 
-import fcntl
 import os
 import time
 from contextlib import contextmanager
 
-from playwright.sync_api import TimeoutError as PWTimeout
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+from patchright.sync_api import TimeoutError as PWTimeout
 
 
 class AlreadyRunning(RuntimeError):
@@ -59,19 +63,28 @@ def retry_read(operation, label, notify, delays=(5, 15, 30)):
 def exclusive_run(lock_path):
     """Hold a kernel lock through cleanup; a process exit releases it."""
     # Do not unlink the file: replacing the inode would allow a second owner.
-    with open(lock_path, "a+") as lock:
+    with open(lock_path, "a+b") as lock:
+        # Windows locks a fixed byte range, which must exist before locking.
+        lock.seek(0, os.SEEK_END)
+        if lock.tell() == 0:
+            lock.write(b"\0")
+            lock.flush()
+        lock.seek(0)
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
             raise AlreadyRunning(
                 "Another bot command is using this profile and history. "
                 "Wait for it to finish before starting another command."
             ) from error
         try:
-            lock.seek(0)
-            lock.truncate()
-            lock.write(str(os.getpid()))
-            lock.flush()
             yield
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)

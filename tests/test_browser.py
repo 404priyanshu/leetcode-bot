@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import sync_playwright
 
 import leetcode_bot as bot
 from runtime import NetworkUnavailable

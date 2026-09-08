@@ -10,24 +10,30 @@ solutions through your logged-in LeetCode account.
 
 ## Requirements
 
-- macOS or Linux
+- Windows 11, macOS or Linux
 - Python 3.10 or newer
 - Google Chrome
 - A LeetCode account
 
 ## Install
 
-From this folder, create a virtual environment and install Playwright:
+**Windows 11:** follow [the complete Windows setup guide](windows/README.md), including the Hermes launch command and lid settings. The commands below are for macOS/Linux.
+
+From this folder, create a virtual environment and install Patchright:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m playwright install chrome
+python -m patchright install chrome
 ```
 
-The last command installs the Chrome browser that Playwright needs. If Chrome
-is already installed, Playwright may reuse or update that installation.
+The last command installs the Chrome browser that Patchright needs. If Chrome
+is already installed, Patchright may reuse or update that installation.
+
+Chrome now runs headed on every platform. Linux scheduled runs need an active
+graphical session (or a configured virtual display); a display-less cron session
+cannot launch headed Chrome. macOS runs also require a GUI session.
 
 ## Log in once
 
@@ -174,7 +180,7 @@ interrupted before updating `solved.json`. JSON progress writes are atomic.
 
 ## Troubleshooting
 
-**`ModuleNotFoundError: No module named 'playwright'`**
+**`ModuleNotFoundError: No module named 'patchright'`**
 
 Activate the virtual environment and install the dependency:
 
@@ -183,10 +189,10 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-**Chrome does not open or Playwright cannot find it**
+**Chrome does not open or Patchright cannot find it**
 
 ```bash
-python -m playwright install chrome
+python -m patchright install chrome
 ```
 
 **`csrftoken not found in cookies - not logged in?`**
@@ -199,9 +205,12 @@ python leetcode_bot.py --setup
 
 **The API circuit breaker is open**
 
-LeetCode returned a `403` or `429` response. After one retry for a Cloudflare
-challenge, the bot stops and pauses requests for about 30 minutes. Wait for the
-cooldown instead of repeatedly restarting it.
+LeetCode returned a `403` or `429` response. Cloudflare challenge pages are
+given time to clear on page loads, followed by one reload. Chrome runs headed
+(off-screen by default on Windows). If requests remain blocked, the bot stops
+and pauses requests for about 30 minutes. Use `--setup` to complete any required
+verification visibly; automatic clearance is not guaranteed.
+Wait for the cooldown instead of repeatedly restarting it.
 
 **Skip a wait or stop a run**
 
@@ -249,7 +258,7 @@ python -m unittest discover -s tests -v
 Include the real-browser tests with an isolated, temporary Chromium profile:
 
 ```bash
-python -m playwright install chromium
+python -m patchright install chromium
 BROWSER_TESTS=1 python -m unittest discover -s tests -v
 ```
 

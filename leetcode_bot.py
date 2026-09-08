@@ -16,17 +16,20 @@ import os
 import random
 import re
 import sys
-import termios
 import time
 import tokenize
-import tty
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from select import select as _fd_select
+if os.name == "nt":
+    import msvcrt
+else:
+    import termios
+    import tty
+    from select import select as _fd_select
 
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import sync_playwright
 
 import reporting
 from runtime import (
@@ -34,15 +37,20 @@ from runtime import (
     exclusive_run, is_network_error, retry_read,
 )
 
-BASE = Path(__file__).parent
-PROFILE_DIR = BASE / "leetcode_profile"  # persistent login
+BASE = Path(__file__).resolve().parent
+# Keep Windows cookies independent of the checkout and scheduler working dir.
+PROFILE_DIR = (
+    Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    / "leetcode-bot" / "profile"
+    if os.name == "nt" else BASE / "leetcode_profile"
+)
 SOLVED_FILE = BASE / "solved.json"  # progress tracker
 LOG_FILE = BASE / "activity.log"
 TELEGRAM_FILE = BASE / "telegram.json"  # {"bot_token": ..., "chat_id": ...}
 STATE_FILE = BASE / "bot_state.json"  # persistent waits + API circuit breaker
 HISTORY_DB = BASE / "attempts.db"  # durable structured history
 REPORT_FILE = BASE / "leetcode_report.xlsx"  # regenerated from HISTORY_DB
-LOCK_FILE = BASE / ".bot.lock"
+LOCK_FILE = PROFILE_DIR.parent / ".leetcode-bot.lock" if os.name == "nt" else BASE / ".bot.lock"
 
 WALKCCC_URL = "https://walkccc.me/LeetCode/problems/{num}/"  # keyed by problem number
 LEETCODE = "https://leetcode.com"
@@ -126,7 +134,7 @@ def say(msg=""):
 
 
 def log(msg):
-    with open(LOG_FILE, "a") as f:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{date.today()} {time.strftime('%H:%M:%S')}] {msg}\n")
 
 
@@ -145,6 +153,10 @@ def refresh_excel_report(announce=False):
 
 class CircuitBreakerOpen(RuntimeError):
     """LeetCode requests are paused after repeated blocking responses."""
+
+
+class CloudflareBlocked(CircuitBreakerOpen):
+    """Cloudflare's challenge page did not clear within the wait period."""
 
 
 class BrowserSessionClosed(RuntimeError):
@@ -249,6 +261,8 @@ class _cbreak:
     """Temporarily switch the terminal to cbreak mode for single-char reads."""
 
     def __enter__(self):
+        if os.name == "nt":
+            return self
         self.fd = sys.stdin.fileno()
         self.saved = termios.tcgetattr(self.fd)
         # TCSANOW, not the default TCSAFLUSH - flushing would drop keystrokes
@@ -256,7 +270,8 @@ class _cbreak:
         tty.setcbreak(self.fd, termios.TCSANOW)
 
     def __exit__(self, *exc):
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        if os.name != "nt":
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
 
 
 def _read_key():
@@ -265,6 +280,13 @@ def _read_key():
     Reads raw bytes from the fd - going through sys.stdin would buffer a
     whole escape sequence, hiding the rest of it from _fd_select.
     """
+    if os.name == "nt":
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            return {"H": "up", "P": "down", "M": "right", "K": "left"}.get(msvcrt.getwch(), "esc")
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return {"\r": "enter", "\n": "enter", " ": "space", "\x1b": "esc"}.get(ch, ch)
     ch = os.read(sys.stdin.fileno(), 1)
     if ch == b"\x1b":  # a lone Esc, or an arrow key's escape sequence
         if _fd_select([sys.stdin], [], [], 0.05)[0]:
@@ -373,19 +395,56 @@ def network_notice(message):
     log(message)
 
 
+def _is_leetcode_url(url):
+    return url == LEETCODE or url.startswith(LEETCODE + "/")
+
+
+def _challenge_cleared(page):
+    """True when the page is no longer Cloudflare's "Just a moment..." page."""
+    try:
+        return "just a moment" not in page.title().lower()
+    except Exception:
+        return True
+
+
+def _wait_for_challenge_clear(page, attempts=30):
+    """Wait briefly for an interstitial to clear on its own."""
+    for _ in range(attempts):
+        if _challenge_cleared(page):
+            return
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            return
+
+
 def navigate(page, url):
     """Retry safe page loads without spending another problem attempt."""
     def load():
         response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
         if response is None:
             raise TransientReadError(f"No HTTP response from {url}")
-        if url.startswith(LEETCODE + "/") or url == LEETCODE:
+        if response.status == 403 and _is_leetcode_url(url):
+            # Cloudflare sometimes answers a page load with its "Just a
+            # moment..." interstitial (HTTP 403). It may clear on its
+            # own, so wait for that and reload once before treating
+            # the response as a block. The wait is a no-op for pages that
+            # are not a challenge page.
+            if not _challenge_cleared(page):
+                log(f"CLOUDFLARE CHALLENGE on {url}")
+                say(yellow("  ! Cloudflare challenge - waiting for it to clear ..."))
+            _wait_for_challenge_clear(page)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if response is None:
+                raise TransientReadError(f"No HTTP response from {url}")
+        if _is_leetcode_url(url) and response.status in BLOCKED_STATUSES:
             record_api_status(response.status, url)
-            if response.status in BLOCKED_STATUSES:
-                update_runtime_state(
-                    api_circuit_open_until=time.time() + BREAKER_COOLDOWN_SECONDS
-                )
-                raise CircuitBreakerOpen(f"LeetCode returned {response.status}")
+            update_runtime_state(
+                api_circuit_open_until=time.time() + BREAKER_COOLDOWN_SECONDS
+            )
+            if response.status == 403 and not _challenge_cleared(page):
+                raise CloudflareBlocked("Cloudflare challenge did not clear; run --setup visibly to complete verification")
+            raise CircuitBreakerOpen(f"LeetCode returned {response.status}")
         if response.status in (408, 429) or response.status >= 500:
             raise TransientReadError(f"HTTP {response.status} from {url}")
         return response
@@ -433,14 +492,12 @@ def api_fetch(
     status, text = res["status"], res["text"]
     record_api_status(status, url)
     # LeetCode's Cloudflare occasionally answers the in-page fetch with its
-    # "Just a moment..." challenge page. Back off, reload the page so the
-    # browser can clear the challenge, then retry the call once.
+    # "Just a moment..." challenge page. Reload the page through navigate(),
+    # which waits for the browser to clear the challenge, then retry once.
     if status == 403 and "Just a moment" in text and not _retried:
         log(f"CLOUDFLARE CHALLENGE on {url}")
         say(yellow("  ! Cloudflare challenge - backing off, then retrying ..."))
-        time.sleep(random.uniform(15, 30))
         navigate(page, referrer)
-        page.wait_for_timeout(10000)  # let the challenge auto-solve
         return api_fetch(page, url, method, payload, csrf, referrer,
                          _retried=True, retry_safe=retry_safe)
     if status in BLOCKED_STATUSES:
@@ -449,6 +506,8 @@ def api_fetch(
         update_runtime_state(
             api_circuit_open_until=time.time() + BREAKER_COOLDOWN_SECONDS
         )
+        if status == 403 and "Just a moment" in text:
+            raise CloudflareBlocked("Cloudflare challenge did not clear; run --setup visibly to complete verification")
         raise CircuitBreakerOpen(
             f"LeetCode returned {status}; retry in about "
             f"{BREAKER_COOLDOWN_SECONDS // 60} min"
@@ -714,27 +773,34 @@ def extract_python_solution(blocks):
 # ---------------- browser + interactive menu ------------------------------
 
 
-def _launch(p, headless):
+def _launch(p, offscreen=False):
+    """Use a dedicated persistent Chrome profile with native browser defaults."""
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    args = ["--window-size=1365,900"]
+    if offscreen and os.name == "nt":
+        args.append("--window-position=-32000,-32000")
+    else:
+        args.append("--window-position=80,80")
     return p.chromium.launch_persistent_context(
         str(PROFILE_DIR),
-        headless=headless,
+        headless=False,
         channel="chrome",
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
-        ignore_default_args=["--enable-automation"],
+        no_viewport=True,
+        args=args,
     )
 
 
 def setup_login():
     with sync_playwright() as p:
-        ctx = _launch(p, headless=False)
-        page = ctx.new_page()
-        page.goto(f"{LEETCODE}/accounts/login/")
-        input("Log in inside the browser, then press Enter here... ")
-        ctx.close()
-        say(green("✓ login saved to leetcode_profile/"))
+        ctx = _launch(p)
+        try:
+            page = ctx.new_page()
+            page.goto(f"{LEETCODE}/accounts/login/")
+            input("Log in inside the browser, then press Enter here... ")
+            verify_login(page)
+        finally:
+            ctx.close()
+        say(green(f"✓ login saved to {PROFILE_DIR}"))
 
 
 # ---------------- Telegram notifications -----------------------------------
@@ -925,9 +991,12 @@ def _wait_until(deadline):
                 if remaining <= 0:
                     completed = True
                     return False
-                if _fd_select([sys.stdin], [], [], min(0.25, remaining))[0]:
-                    key = os.read(sys.stdin.fileno(), 1).lower()
-                    if key == b"s":
+                if os.name == "nt":
+                    if msvcrt.kbhit() and _read_key().lower() == "s":
+                        return True
+                    time.sleep(min(0.25, remaining))
+                elif _fd_select([sys.stdin], [], [], min(0.25, remaining))[0]:
+                    if os.read(sys.stdin.fileno(), 1).lower() == b"s":
                         return True
     finally:
         if completed:
@@ -1064,6 +1133,8 @@ def run_session(ctx, cfg, session_id, result):
                 say(dim("  running example tests ..."))
                 paced_attempt = True
                 stage("Example tests")
+                if cfg["timing"] != "instant":
+                    page.wait_for_timeout(random.uniform(600, 1800))
                 run = run_solution(page, csrf, slug, qid, code, data_input)
                 tests_passed = bool(run.get("correct_answer"))
                 if not tests_passed:
@@ -1082,6 +1153,8 @@ def run_session(ctx, cfg, session_id, result):
                 say(dim("  submitting ..."))
                 paced_attempt = True
                 stage("Submission")
+                if cfg["timing"] != "instant":
+                    page.wait_for_timeout(random.uniform(800, 2200))
                 res = submit_solution(
                     page, csrf, slug, qid, code,
                     on_submitted=lambda submission_id: reporting.record_submission(
@@ -1169,7 +1242,7 @@ def execute_session(cfg):
             say(dim(f"start jitter: sleeping {jitter / 60:.0f} min ..."))
             _wait_until(time.time() + jitter)
         with sync_playwright() as p:
-            ctx = _launch(p, headless=True)
+            ctx = _launch(p, offscreen=not cfg.get("visible_browser", False))
             try:
                 run_session(ctx, cfg, session_id, result)
             finally:
@@ -1266,9 +1339,12 @@ def main():
     ap.add_argument(
         "--no-menu", action="store_true", help="skip the interactive menu (cron mode)"
     )
+    ap.add_argument("--visible-browser", action="store_true",
+                    help="keep the headed Chrome window on screen on Windows")
     args = ap.parse_args()
 
     try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_run(LOCK_FILE):
             return run_command(args)
     except AlreadyRunning as error:
@@ -1295,6 +1371,7 @@ def run_command(args):
         "count": args.count,
         "timing": "instant" if args.instant else "human",
         "interactive": False,
+        "visible_browser": getattr(args, "visible_browser", False),
     }
 
     # Bare run in a terminal opens the menu; any run flags go straight to work.
@@ -1315,4 +1392,7 @@ def run_command(args):
 
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     sys.exit(main())

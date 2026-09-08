@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import leetcode_bot as bot
 import reporting
@@ -124,6 +124,14 @@ class SessionTests(IsolatedBotTest):
         self.assertEqual(self.rows('sessions')[0]['status'], 'Rate limited')
         self.launch.assert_not_called()
 
+    def test_cloudflare_block_stops_without_restarting_session(self):
+        self.prepare_session()
+        self.navigate.side_effect = bot.CloudflareBlocked('Run --setup')
+        self.assertEqual(self.execute(), 1)
+        self.submit.assert_not_called()
+        self.launch.assert_called_once()
+        self.assertEqual(self.rows('sessions')[0]['status'], 'Rate limited')
+
     def test_interrupt_during_jitter_has_finished_session(self):
         self.prepare_session()
         self.cfg['timing'] = 'human'
@@ -190,8 +198,48 @@ class ApiTests(IsolatedBotTest):
         page.goto.side_effect = [RuntimeError('net::ERR_NETWORK_CHANGED'),
                                 RuntimeError('net::ERR_CONNECTION_REFUSED'), Mock(status=200)]
         self.assertEqual(bot.navigate(page, 'https://walkccc.me/test').status, 200)
-        self.assertEqual({call.args[0] for call in page.goto.call_args_list},
+        self.assertEqual({call_.args[0] for call_ in page.goto.call_args_list},
                          {'https://walkccc.me/test'})
+
+    def test_cloudflare_page_challenge_clears_and_retries_once(self):
+        page = Mock()
+        page.title.side_effect = ['Just a moment...', 'Two Sum - LeetCode']
+        page.goto.side_effect = [Mock(status=403), Mock(status=200)]
+        url = bot.LEETCODE + '/problems/two-sum/'
+        self.assertEqual(bot.navigate(page, url).status, 200)
+        self.assertEqual([call_.args[0] for call_ in page.goto.call_args_list], [url, url])
+        self.assertNotIn('api_circuit_open_until', bot.load_runtime_state())
+
+    def test_plain_403_page_load_retries_once_before_breaker(self):
+        page = Mock()
+        page.title.return_value = 'Access denied | LeetCode'
+        page.goto.return_value = Mock(status=403)
+        with self.assertRaises(bot.CircuitBreakerOpen) as caught:
+            bot.navigate(page, bot.LEETCODE)
+        self.assertNotIsInstance(caught.exception, bot.CloudflareBlocked)
+        self.assertEqual(page.goto.call_count, 2)
+        self.assertGreater(bot.load_runtime_state()['api_circuit_open_until'],
+                           bot.time.time())
+
+    def test_persistent_cloudflare_block_raises_and_opens_circuit(self):
+        page = Mock()
+        page.title.return_value = 'Just a moment...'
+        page.goto.return_value = Mock(status=403)
+        with self.assertRaises(bot.CloudflareBlocked):
+            bot.navigate(page, bot.LEETCODE)
+        self.assertEqual(page.goto.call_count, 2)
+        self.assertGreater(bot.load_runtime_state()['api_circuit_open_until'],
+                           bot.time.time())
+
+    def test_api_cloudflare_challenge_that_never_clears_blocks(self):
+        page = Mock()
+        page.evaluate.return_value = {'status': 403, 'text': 'Just a moment...'}
+        with patch.object(bot, 'navigate') as nav:
+            with self.assertRaises(bot.CloudflareBlocked):
+                bot.api_fetch(page, bot.LEETCODE + '/graphql', 'POST',
+                              retry_safe=True)
+        self.assertGreater(bot.load_runtime_state()['api_circuit_open_until'],
+                           bot.time.time())
 
     def test_readonly_graphql_retries_but_submission_never_replays(self):
         page = Mock()

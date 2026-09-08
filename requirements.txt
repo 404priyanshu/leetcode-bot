@@ -1,2 +1,2 @@
-playwright==1.62.0
+patchright==1.62.3
 openpyxl==3.1.5

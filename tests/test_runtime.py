@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from playwright.sync_api import TimeoutError
+from patchright.sync_api import TimeoutError
 
 from runtime import AlreadyRunning, NetworkUnavailable, exclusive_run, retry_read
 

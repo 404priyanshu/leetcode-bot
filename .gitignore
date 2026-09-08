@@ -13,3 +13,5 @@ attempts.db
 attempts.db-shm
 attempts.db-wal
 leetcode_report.xlsx
+
+logs/
