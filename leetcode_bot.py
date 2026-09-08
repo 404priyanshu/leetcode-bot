@@ -15,13 +15,14 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import signal
 import time
 import tokenize
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 if os.name == "nt":
     import msvcrt
@@ -338,23 +339,49 @@ def _clear(count):
         sys.stdout.flush()
 
 
-def select(title, options, default=0):
+class Heading(str):
+    """A section label inside a menu; shown, but never selectable."""
+
+
+def _step(options, idx, delta):
+    """Move to the next selectable row, skipping section headings."""
+    for _ in range(len(options)):
+        idx = (idx + delta) % len(options)
+        if not isinstance(options[idx], Heading):
+            return idx
+    return idx
+
+
+def _footer(hint, keys):
+    """Explain the highlighted row, then the keys that act on it."""
+    return ["", dim(f"  {hint}" if hint else "  "), dim(f"  {keys}")]
+
+
+def select(title, options, default=0, hints=None, header=None):
     """Arrow-key picker. Returns the chosen index, or None if cancelled."""
     if not options or not sys.stdin.isatty():
         return default
     idx = min(max(default, 0), len(options) - 1)
+    if isinstance(options[idx], Heading):
+        idx = _step(options, idx, 1)
     drawn = 0
     with _cbreak():
         while True:
-            lines = [bold(title), dim("↑/↓ move · Enter select · Esc/q cancel"), ""]
+            lines = [bold(f"  {title}")] + list(header or [])
             for i, opt in enumerate(options):
-                lines.append(cyan(f"❯ {opt}") if i == idx else f"  {opt}")
+                if isinstance(opt, Heading):
+                    lines.append(dim(f"  {opt}"))
+                elif i == idx:
+                    lines.append(cyan(f"  ❯ {opt}"))
+                else:
+                    lines.append(f"    {opt}")
+            lines += _footer((hints or {}).get(idx), "↑/↓ move · Enter choose · Esc quit")
             drawn = _draw(lines, drawn)
             key = _read_key()
             if key in ("up", "k"):
-                idx = (idx - 1) % len(options)
+                idx = _step(options, idx, -1)
             elif key in ("down", "j"):
-                idx = (idx + 1) % len(options)
+                idx = _step(options, idx, 1)
             elif key == "enter":
                 _clear(drawn)
                 return idx
@@ -363,37 +390,84 @@ def select(title, options, default=0):
                 return None
 
 
-def checkbox(title, options, checked):
+def checkbox(title, options, checked, hints=None, header=None):
     """Multi-select toggled with Space. Returns list of bools, or None."""
     if not sys.stdin.isatty():
         return list(checked)
     state, idx, drawn = list(checked), 0, 0
-    hint = "↑/↓ move · Space toggle · Enter save · Esc cancel"
+    note = ""
     with _cbreak():
         while True:
-            lines = [bold(title), dim(hint), ""]
+            picked = sum(1 for on in state if on)
+            lines = [bold(f"  {title}"), dim(f"  {picked} of {len(options)} selected")]
+            lines += list(header or [])
             for i, opt in enumerate(options):
-                mark = "[x]" if state[i] else "[ ]"
-                lines.append(
-                    cyan(f"❯ {mark} {opt}") if i == idx else f"  {mark} {opt}"
-                )
+                mark = green("[x]") if state[i] else "[ ]"
+                row = f"{mark} {opt}"
+                lines.append(cyan(f"  ❯ {row}") if i == idx else f"    {row}")
+            lines += _footer(
+                note or (hints or {}).get(idx),
+                "↑/↓ move · Space tick · Enter save · Esc cancel",
+            )
             drawn = _draw(lines, drawn)
             key = _read_key()
+            note = ""
             if key in ("up", "k"):
                 idx = (idx - 1) % len(options)
             elif key in ("down", "j"):
                 idx = (idx + 1) % len(options)
             elif key == "space":
                 state[idx] = not state[idx]
-                hint = "↑/↓ move · Space toggle · Enter save · Esc cancel"
             elif key == "enter":
                 if any(state):
                     _clear(drawn)
                     return state
-                hint = yellow("pick at least one option")
+                note = yellow("tick at least one with Space first")
             elif key in ("esc", "q"):
                 _clear(drawn)
                 return None
+
+
+def ask(title, prompt, help_lines=(), check=None):
+    """Inline text field. Returns the accepted text, or None if cancelled."""
+    if not sys.stdin.isatty():
+        raise EOFError("a terminal is required for this prompt")
+    text, note, drawn = "", "", 0
+    with _cbreak():
+        while True:
+            lines = [bold(f"  {title}"), ""]
+            lines += [dim(f"  {line}") for line in help_lines]
+            lines += ["", f"  {prompt}: {cyan(text)}{dim('▏')}"]
+            lines += _footer(note or "", "type · Enter confirm · Esc cancel")
+            drawn = _draw(lines, drawn)
+            key = _read_key()
+            if key == "enter":
+                try:
+                    value = check(text) if check else text
+                except ValueError as error:
+                    note = yellow(str(error))
+                    continue
+                _clear(drawn)
+                return value
+            if key == "esc":
+                _clear(drawn)
+                return None
+            if key in ("\x7f", "\x08"):
+                text, note = text[:-1], ""
+            elif key == "space":
+                text, note = text + " ", ""
+            elif len(key) == 1 and key.isprintable():
+                text, note = text + key, ""
+
+
+def confirm(title, rows, action, warning=""):
+    """Show what is about to happen and let the user back out."""
+    header = [""] + [f"    {dim(label + ':'):<24} {value}" for label, value in rows]
+    if warning:
+        header += ["", f"  {yellow(warning)}"]
+    header += [""]
+    chosen = select(title, [action, "Back"], hints={0: warning}, header=header)
+    return chosen == 0
 
 
 # ---------------- LeetCode API helpers (fetch through the real page) -------
@@ -808,6 +882,53 @@ def _launch(p, offscreen=False):
     )
 
 
+def _ago(stamp):
+    """Turn a stored timestamp into a short, readable age."""
+    try:
+        days = (date.today() - datetime.fromisoformat(stamp).date()).days
+    except (TypeError, ValueError):
+        return "run before"
+    if days <= 0:
+        return "run today"
+    if days == 1:
+        return "run yesterday"
+    return f"run {days} days ago"
+
+
+def account_summary(name):
+    """One readable line per account, read from files without creating any."""
+    paths = accounts.paths(name)
+    try:
+        identity = accounts.expected_username(name)
+    except ValueError:
+        identity = None
+    if identity is None:
+        return (name, yellow("not set up yet"))
+    parts = [identity]
+    try:
+        solved = json.loads((paths["data"] / "solved.json").read_text())
+        parts.append(f"{len(solved)} solved")
+    except (OSError, ValueError):
+        pass
+    last = reporting.last_session_at(paths["data"] / "attempts.db")
+    parts.append(_ago(last) if last else "never run")
+    return (name, dim(" · ".join(parts)))
+
+
+def account_header(names, limit=4):
+    """Show who the bot knows about, so the menu is not a blind list."""
+    known = accounts.list_accounts()
+    rows = [account_summary(name) for name in known[:limit]]
+    width = max((len(name) for name, _ in rows), default=0)
+    lines = []
+    for name, detail in rows:
+        mark = green("●") if name in names else dim("○")
+        lines.append(f"  {mark} {bold(name.ljust(width))}  {detail}")
+    if len(known) > limit:
+        lines.append(dim(f"    +{len(known) - limit} more"))
+    return lines + [""]
+
+
 def register_account_if_needed(name):
     """Bind a named account to its expected username before the first login."""
     if name == "default":
@@ -822,27 +943,72 @@ def register_account_if_needed(name):
         say(f"Log in as {existing}; other usernames will be rejected.")
 
 
-def account_setup(name):
+def account_setup(name, username=None):
     """Register if needed and log in with every path bound to that account."""
     previous = ACCOUNT_NAME
     try:
         configure_account(name)
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_run(LOCK_FILE):
-            register_account_if_needed(name)
+            if username:
+                accounts.register(name, username)
+            else:
+                register_account_if_needed(name)
             setup_login()
     finally:
         configure_account(previous)
 
 
-def add_account():
-    """Ask for a new account name from the menu, then log into it."""
-    name = accounts.validate_name(
-        input("New account name (lowercase, e.g. jaagrett): ").strip().lower()
-    )
+def _new_name(text):
+    name = accounts.validate_name(text.strip().lower())
     if name in accounts.list_accounts():
-        raise ValueError(f"Account {name} already exists; pick another name.")
-    account_setup(name)
+        raise ValueError(f"“{name}” is already set up; pick another nickname.")
+    return name
+
+
+def _new_username(text):
+    text = text.strip()
+    if not text:
+        raise ValueError("Enter the username you sign in with.")
+    if "@" in text:
+        raise ValueError("That looks like an email. LeetCode usernames have no @.")
+    return text
+
+
+def add_account():
+    """Walk through naming, binding and logging into a new account."""
+    name = ask(
+        "Add an account  ·  step 1 of 3",
+        "Nickname",
+        [
+            "A short name for this login on this computer only.",
+            "Lowercase letters, digits, - or _.  Example: jaagrett",
+        ],
+        check=_new_name,
+    )
+    if name is None:
+        return None
+    username = ask(
+        "Add an account  ·  step 2 of 3",
+        "LeetCode username",
+        [
+            f"The username “{name}” signs in with on leetcode.com.",
+            "It is checked before every run, so the bot can never",
+            "submit to the wrong account.",
+        ],
+        check=_new_username,
+    )
+    if username is None:
+        return None
+    ready = confirm(
+        "Add an account  ·  step 3 of 3",
+        [("Nickname", name), ("LeetCode username", username)],
+        "Open the browser and log in",
+        "A browser window opens next. Log in there, then come back here.",
+    )
+    if not ready:
+        return None
+    account_setup(name, username)
     return name
 
 
@@ -912,56 +1078,90 @@ def setup_telegram():
         say(red("✗ test message failed - check the token and chat id"))
 
 
+MENU_HINTS = {
+    "start": "Solves and submits to LeetCode using the accounts marked ●.",
+    "accounts": "Pick which logins this run uses. One, or several in turn.",
+    "difficulty": "Which difficulties problems are chosen from.",
+    "count": "How many accepted solutions to aim for, per account.",
+    "timing": "Human-like spreads the work out. Instant does not wait at all.",
+    "add": "Set up another LeetCode login: nickname, username, then sign in.",
+    "login": "Reopen the browser for an account, or fix an expired session.",
+    "telegram": "Optional: get a message when a run finishes.",
+    "quit": "Leave without running anything.",
+}
+
+
+def menu_rows(cfg, names):
+    """Build the menu as (key, label, value) rows and section headings."""
+    diffs = cfg["difficulties"]
+    diff_label = (
+        "All"
+        if set(diffs) >= set(DIFFICULTIES)
+        else "+".join(DIFF_LABEL[d] for d in DIFFICULTIES if d in diffs)
+    )
+    count_label = "Random, 1-9" if cfg["count"] is None else str(cfg["count"])
+    timing_label = "Human-like" if cfg["timing"] == "human" else "Instant"
+    account_label = names[0] if len(names) == 1 else f"{len(names)} accounts, in turn"
+    return [
+        Heading("RUN"),
+        ("start", "Start run", f"{account_label} · {diff_label} · {count_label} each"),
+        ("accounts", "Accounts", account_label),
+        ("difficulty", "Difficulty", diff_label),
+        ("count", "Problems per account", count_label),
+        ("timing", "Speed", timing_label),
+        Heading("SET UP"),
+        ("add", "Add an account", "another LeetCode login"),
+        ("login", "Log in again", "reopen the browser"),
+        ("telegram", "Telegram alerts", "when a run finishes"),
+        ("quit", "Quit", ""),
+    ]
+
+
 def run_menu(cfg):
     """Arrow-key configuration menu. Returns the config, or None to quit."""
     while True:
-        diffs = cfg["difficulties"]
-        diff_label = (
-            "All"
-            if set(diffs) >= set(DIFFICULTIES)
-            else "+".join(DIFF_LABEL[d] for d in DIFFICULTIES if d in diffs)
-        )
-        count_label = "Random (human-like)" if cfg["count"] is None else str(cfg["count"])
-        timing_label = "Human-like" if cfg["timing"] == "human" else "Instant"
         names = cfg.get("accounts") or [ACCOUNT_NAME]
-        account_label = (
-            names[0] if len(names) == 1
-            else f"{len(names)} accounts ({', '.join(names)})"
+        rows = menu_rows(cfg, names)
+        width = max(len(row[1]) for row in rows if not isinstance(row, Heading))
+        options, hints = [], {}
+        for i, row in enumerate(rows):
+            if isinstance(row, Heading):
+                options.append(row)
+                continue
+            key, label, value = row
+            options.append(f"{label.ljust(width)}  {dim(value)}" if value else label)
+            hints[i] = MENU_HINTS[key]
+        chosen = select(
+            "LeetCode Bot", options, default=1, hints=hints,
+            header=account_header(names),
         )
-        options = [
-            f"{'Start run':<12} {account_label} · {diff_label} · {count_label} · {timing_label}",
-            f"{'Accounts':<12} {account_label}",
-            f"{'Difficulty':<12} {diff_label}",
-            f"{'Problems':<12} {count_label}",
-            f"{'Timing':<12} {timing_label}",
-            f"{'Add account':<12} register another LeetCode login",
-            f"{'Log in':<12} one-time LeetCode setup",
-            f"{'Telegram':<12} configure notifications",
-            "Quit",
-        ]
-        i = select("LeetCode Bot", options)
-        if i in (None, 8):
+        key = "quit" if chosen is None else rows[chosen][0]
+        if key == "quit":
             return None
-        if i == 0:
+        if key == "start":
             return cfg
         try:
-            cfg = _menu_action(i, cfg, diffs, names)
+            cfg = _menu_action(key, cfg, names)
         except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:
             say(red(f"✗ {error}"))
         except (KeyboardInterrupt, EOFError):
             say(yellow("cancelled"))
 
 
-def _menu_action(i, cfg, diffs, names):
+def _menu_action(key, cfg, names):
     """Apply one menu choice and return the updated config."""
-    if i == 1:
+    if key == "accounts":
         known = accounts.list_accounts()
-        res = checkbox("Run on accounts", known, [n in names for n in known])
+        res = checkbox(
+            "Run on which accounts?", known, [n in known and n in names for n in known],
+            header=["", dim("  Several accounts run one after another, never at once."), ""],
+        )
         if res:
             return {**cfg, "accounts": [n for n, on in zip(known, res) if on]}
-    elif i == 2:
+    elif key == "difficulty":
+        diffs = cfg["difficulties"]
         res = checkbox(
-            "Difficulty",
+            "Which difficulties?",
             [DIFF_LABEL[d] for d in DIFFICULTIES],
             [d in diffs for d in DIFFICULTIES],
         )
@@ -970,25 +1170,34 @@ def _menu_action(i, cfg, diffs, names):
                 **cfg,
                 "difficulties": tuple(d for d, on in zip(DIFFICULTIES, res) if on),
             }
-    elif i == 3:
+    elif key == "count":
         res = select(
-            "Problems per run",
-            ["Random (human-like, 1-9)"] + [str(x) for x in range(1, 11)],
+            "How many problems per account?",
+            ["Random, 1-9 (looks more human)"] + [str(x) for x in range(1, 11)],
         )
         if res is not None:
             return {**cfg, "count": None if res == 0 else res}
-    elif i == 4:
-        res = select("Timing", ["Human-like (3-12 min gaps)", "Instant (no waits)"])
+    elif key == "timing":
+        res = select(
+            "How fast should it work?",
+            ["Human-like — 3-12 min between problems", "Instant — no waiting"],
+            hints={
+                0: "Recommended. Spacing the work out looks less automated.",
+                1: "Fast, but an obvious pattern on your account.",
+            },
+        )
         if res is not None:
             return {**cfg, "timing": ("human", "instant")[res]}
-    elif i == 5:
-        selected = set(names) | {add_account()}
-        return {**cfg, "accounts": [n for n in accounts.list_accounts() if n in selected]}
-    elif i == 6:
+    elif key == "add":
+        added = add_account()
+        if added:
+            selected = set(names) | {added}
+            return {**cfg, "accounts": [n for n in accounts.list_accounts() if n in selected]}
+    elif key == "login":
         chosen = 0 if len(names) == 1 else select("Log in to which account?", names)
         if chosen is not None:
             account_setup(names[chosen])
-    elif i == 7:
+    elif key == "telegram":
         setup_telegram()
     return cfg
 

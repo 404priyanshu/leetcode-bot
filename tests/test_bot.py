@@ -380,3 +380,57 @@ class InputAndExtractionTests(unittest.TestCase):
         compile(cleaned, '<solution>', 'exec')
         only_docstring = 'def solve():\n    """only body"""\n'
         self.assertEqual(bot.strip_comments(only_docstring), only_docstring)
+
+
+class MenuWidgetTests(unittest.TestCase):
+    """The menu's own input handling, driven by synthetic keypresses."""
+
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        terminal = Mock(isatty=Mock(return_value=True))
+        self.stack.enter_context(patch.object(bot.sys, 'stdin', terminal))
+        self.stack.enter_context(patch.object(bot, '_cbreak'))
+        self.drawn = []
+        self.stack.enter_context(
+            patch.object(bot, '_draw', side_effect=lambda lines, prev: self.drawn.append(lines) or len(lines)))
+        self.stack.enter_context(patch.object(bot, '_clear'))
+
+    def keys(self, *presses):
+        return self.stack.enter_context(patch.object(bot, '_read_key', side_effect=list(presses)))
+
+    def test_arrow_keys_skip_section_headings(self):
+        options = [bot.Heading('RUN'), 'Start', bot.Heading('SET UP'), 'Quit']
+        self.keys('down', 'enter')
+        self.assertEqual(bot.select('t', options, default=1), 3)
+        self.keys('up', 'enter')
+        self.assertEqual(bot.select('t', options, default=1), 3)
+
+    def test_typing_supports_backspace_and_returns_the_text(self):
+        self.keys('a', 'b', '\x7f', 'c', 'space', 'd', 'enter')
+        self.assertEqual(bot.ask('t', 'Name'), 'ac d')
+
+    def test_rejected_input_explains_itself_and_keeps_the_field_open(self):
+        def check(text):
+            if text != 'good':
+                raise ValueError('needs to be good')
+            return text
+        self.keys('b', 'enter', '\x7f', 'g', 'o', 'o', 'd', 'enter')
+        self.assertEqual(bot.ask('t', 'Name', check=check), 'good')
+        self.assertTrue(any('needs to be good' in ''.join(lines) for lines in self.drawn))
+
+    def test_escape_cancels_the_field(self):
+        self.keys('a', 'esc')
+        self.assertIsNone(bot.ask('t', 'Name'))
+
+    def test_confirm_offers_a_way_back(self):
+        self.keys('enter')
+        self.assertTrue(bot.confirm('t', [('Nickname', 'jaagrett')], 'Go', 'careful'))
+        self.keys('down', 'enter')
+        self.assertFalse(bot.confirm('t', [('Nickname', 'jaagrett')], 'Go'))
+        self.assertTrue(any('jaagrett' in ''.join(lines) for lines in self.drawn))
+
+    def test_checkbox_refuses_an_empty_selection(self):
+        self.keys('enter', 'space', 'enter')
+        self.assertEqual(bot.checkbox('t', ['a', 'b'], [False, False]), [True, False])
+        self.assertTrue(any('at least one' in ''.join(lines) for lines in self.drawn))

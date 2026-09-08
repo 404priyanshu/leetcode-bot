@@ -122,39 +122,75 @@ class AccountTests(unittest.TestCase):
         (self.root / 'accounts' / 'Bad Name').mkdir(parents=True)
         self.assertEqual(accounts.list_accounts(), ['default', 'account2', 'account3'])
 
-    def menu(self, choices, checks=(), answers=()):
-        with patch.object(bot, 'select', side_effect=list(choices)), \
+    BASE_CFG = {'difficulties': ('easy',), 'count': 1, 'timing': 'instant',
+                'interactive': True, 'accounts': ['default']}
+
+    def row_index(self, key):
+        """Resolve a menu row by key so tests survive menu reordering."""
+        rows = bot.menu_rows(self.BASE_CFG, ['default'])
+        return next(i for i, row in enumerate(rows)
+                    if not isinstance(row, bot.Heading) and row[0] == key)
+
+    def menu(self, keys, checks=(), cfg=None):
+        picks = [self.row_index(key) for key in keys]
+
+        def choose(title, options, default=0, hints=None, header=None):
+            return picks.pop(0)
+
+        with patch.object(bot, 'select', side_effect=choose), \
                 patch.object(bot, 'checkbox', side_effect=list(checks)), \
-                patch('builtins.input', side_effect=list(answers)), \
                 patch.object(bot, 'setup_login'):
-            return bot.run_menu({'difficulties': ('easy',), 'count': 1, 'timing': 'instant',
-                                 'interactive': True, 'accounts': ['default']})
+            return bot.run_menu({**self.BASE_CFG, **(cfg or {})})
 
     def test_menu_selects_several_accounts_to_run(self):
         for name in ('account2', 'account3'):
             accounts.register(name, name + 'user')
-        cfg = self.menu(choices=[1, 0], checks=[[True, True, False]])
+        cfg = self.menu(['accounts', 'start'], checks=[[True, True, False]])
         self.assertEqual(cfg['accounts'], ['default', 'account2'])
 
     def test_menu_adds_account_and_includes_it_in_the_run(self):
-        cfg = self.menu(choices=[5, 0], answers=['Jaagrett', 'Jaagrett'])
+        with patch.object(bot, 'ask', side_effect=['jaagrett', 'Jaagrett']), \
+                patch.object(bot, 'confirm', return_value=True):
+            cfg = self.menu(['add', 'start'])
         self.assertEqual(cfg['accounts'], ['default', 'jaagrett'])
         self.assertEqual(accounts.expected_username('jaagrett'), 'Jaagrett')
 
-    def test_menu_reports_bad_account_input_and_stays_open(self):
+    def test_menu_add_account_can_be_cancelled_at_every_step(self):
+        for answers, confirmed in ((['jaagrett', None], True), ([None], True),
+                                   (['jaagrett', 'Jaagrett'], False)):
+            with patch.object(bot, 'ask', side_effect=answers), \
+                    patch.object(bot, 'confirm', return_value=confirmed), \
+                    patch.object(bot, 'account_setup') as setup:
+                cfg = self.menu(['add', 'start'])
+            self.assertEqual(cfg['accounts'], ['default'])
+            setup.assert_not_called()
+        self.assertEqual(accounts.list_accounts(), ['default'])
+
+    def test_new_account_answers_are_validated_before_the_browser_opens(self):
         accounts.register('account2', 'alice')
-        with patch.object(bot, 'say') as say:
-            cfg = self.menu(choices=[5, 0], answers=['account2'])
-        self.assertEqual(cfg['accounts'], ['default'])
-        self.assertIn('already exists', ' '.join(str(c.args[0]) for c in say.call_args_list))
+        for bad in ('account2', '../escape', 'con', 'com1', 'a b', ''):
+            with self.assertRaises(ValueError):
+                bot._new_name(bad)
+        self.assertEqual(bot._new_name('  Jaagrett '), 'jaagrett')
+        for bad in ('', '   ', 'me@example.com'):
+            with self.assertRaises(ValueError):
+                bot._new_username(bad)
+        self.assertEqual(bot._new_username(' Jaagrett '), 'Jaagrett')
 
     def test_menu_login_targets_the_selected_account(self):
         accounts.register('account2', 'alice')
-        with patch.object(bot, 'select', side_effect=[6, 0]), \
-                patch.object(bot, 'account_setup') as setup:
-            bot.run_menu({'difficulties': ('easy',), 'count': 1, 'timing': 'instant',
-                          'interactive': True, 'accounts': ['account2']})
+        with patch.object(bot, 'account_setup') as setup:
+            self.menu(['login', 'quit'], cfg={'accounts': ['account2']})
         setup.assert_called_once_with('account2')
+
+    def test_menu_header_shows_setup_state_and_selection(self):
+        accounts.register('account2', 'alice')
+        (accounts.paths('account2')['data'] / 'solved.json').write_text('["1", "2"]')
+        lines = bot.account_header(['account2'])
+        self.assertTrue(any('not set up yet' in line for line in lines))
+        marked = next(line for line in lines if 'account2' in line)
+        self.assertIn('2 solved', marked)
+        self.assertIn('never run', marked)
 
     def sessions(self, codes):
         seen = []

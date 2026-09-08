@@ -165,8 +165,9 @@ flags and choosing **Add account**:
 .\.venv\Scripts\python.exe leetcode_bot.py
 ```
 
-The menu's **Accounts** entry then selects which accounts a run uses, and
-**Log in** repeats setup for one of them. A menu run works through the selected
+The menu lists each account with its username, solved count and last run.
+**Accounts** selects which of them a run uses, and **Log in again** reopens the
+browser for one of them. A menu run works through the selected
 accounts one at a time, using the same stop rules as the Hermes batch below.
 
 The equivalent commands, for scripting or a session without a terminal:

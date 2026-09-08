@@ -187,6 +187,15 @@ def accepted_problem_ids(db_path):
         )]
 
 
+def last_session_at(db_path):
+    """Most recent session start, or None when nothing has run yet."""
+    if not Path(db_path).exists():
+        return None
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT MAX(started_at) FROM sessions").fetchone()
+    return row[0] if row and row[0] else None
+
+
 def update_attempt_stage(db_path, attempt_id, stage):
     with _connect(db_path) as conn:
         conn.execute("UPDATE attempts SET stage = ? WHERE attempt_id = ?",

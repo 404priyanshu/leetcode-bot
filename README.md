@@ -13,14 +13,19 @@ outcomes, see the [development issue log](docs/development-issues.md).
 
 ## Multiple accounts
 
-Run the bot with no flags to open the menu, which adds accounts and picks which
-ones to run:
+Run the bot with no flags to open the menu. It lists every account it knows
+about with its username, solved count and last run, and marks the ones the next
+run will use:
 
-- **Add account** asks for a name and the expected LeetCode username, then opens
-  the browser so you can log in.
-- **Accounts** selects one account or several with Space; a multi-account run
-  works through them one at a time.
-- **Log in** repeats setup for the selected account.
+- **Add an account** walks through three steps: a nickname for this computer,
+  the LeetCode username to expect, then a confirmation before the browser opens.
+  Each answer is checked as you type, and Esc backs out at any step.
+- **Accounts** ticks one login or several with Space; several run one after
+  another, never at the same time.
+- **Log in again** reopens the browser for the selected account, for a first
+  sign-in or an expired session.
+
+Every row explains itself at the bottom of the screen as you move through it.
 
 The same actions are available as `--account NAME --setup` and
 `--account NAME` for scripted use. The existing account remains `default`, with
