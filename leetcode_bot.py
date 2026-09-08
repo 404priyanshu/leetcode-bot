@@ -895,6 +895,14 @@ def _ago(stamp):
     return f"run {days} days ago"
 
 
+def _signed_in(paths):
+    """A persistent Chrome profile with contents means a login was saved."""
+    try:
+        return any(paths["profile"].iterdir())
+    except OSError:
+        return False
+
+
 def account_summary(name):
     """One readable line per account, read from files without creating any."""
     paths = accounts.paths(name)
@@ -902,17 +910,19 @@ def account_summary(name):
         identity = accounts.expected_username(name)
     except ValueError:
         identity = None
-    if identity is None:
-        return (name, yellow("not set up yet"))
-    parts = [identity]
+    facts = []
     try:
-        solved = json.loads((paths["data"] / "solved.json").read_text())
-        parts.append(f"{len(solved)} solved")
+        facts.append(f"{len(json.loads((paths['data'] / 'solved.json').read_text()))} solved")
     except (OSError, ValueError):
         pass
     last = reporting.last_session_at(paths["data"] / "attempts.db")
-    parts.append(_ago(last) if last else "never run")
-    return (name, dim(" · ".join(parts)))
+    facts.append(_ago(last) if last else "never run")
+    if identity:
+        return (name, dim(" · ".join([identity] + facts)))
+    if _signed_in(paths):
+        # Only a run can read the username back from LeetCode.
+        return (name, dim(" · ".join(facts + ["username saved on next run"])))
+    return (name, yellow("not set up yet · choose “Log in again”"))
 
 
 def account_header(names, limit=4):

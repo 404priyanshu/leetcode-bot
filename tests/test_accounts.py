@@ -189,8 +189,22 @@ class AccountTests(unittest.TestCase):
         lines = bot.account_header(['account2'])
         self.assertTrue(any('not set up yet' in line for line in lines))
         marked = next(line for line in lines if 'account2' in line)
+        self.assertIn('alice', marked)
         self.assertIn('2 solved', marked)
         self.assertIn('never run', marked)
+
+    def test_signed_in_account_without_a_recorded_username_is_not_called_unset(self):
+        paths = accounts.paths('default')
+        paths['profile'].mkdir(parents=True)
+        (paths['profile'] / 'Cookies').write_text('x')
+        (paths['data'] / 'solved.json').write_text('["1", "2", "3"]')
+        name, detail = bot.account_summary('default')
+        self.assertNotIn('not set up', detail)
+        self.assertIn('3 solved', detail)
+        self.assertIn('username saved on next run', detail)
+
+    def test_account_with_nothing_saved_is_called_unset(self):
+        self.assertIn('not set up yet', bot.account_summary('default')[1])
 
     def sessions(self, codes):
         seen = []
