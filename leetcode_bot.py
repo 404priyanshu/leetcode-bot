@@ -35,6 +35,7 @@ from patchright.sync_api import sync_playwright
 
 import reporting
 import accounts
+import dashboard
 from runtime import (
     AlreadyRunning, NetworkUnavailable, TransientReadError,
     exclusive_run, is_network_error, retry_read,
@@ -56,6 +57,15 @@ REPORT_FILE = BASE / "leetcode_report.xlsx"  # regenerated from HISTORY_DB
 LOCK_FILE = PROFILE_DIR.parent / ".leetcode-bot.lock" if os.name == "nt" else BASE / ".bot.lock"
 
 ACCOUNT_NAME = "default"
+VIEW = dashboard.NullView()  # replaced by a live panel for interactive runs
+
+STAGE_TEXT = {
+    "Selected": "picking a problem ...",
+    "Solution fetch": "fetching the solution ...",
+    "Problem metadata": "opening the problem ...",
+    "Example tests": "running the example tests ...",
+    "Submission": "submitting ...",
+}
 
 
 def configure_account(name):
@@ -148,12 +158,13 @@ def cyan(t):
 
 
 def say(msg=""):
-    print(f"[{ACCOUNT_NAME}] {msg}", flush=True)
+    # The live panel already names the account, so the prefix would be noise.
+    VIEW.log(msg if VIEW.active else f"[{ACCOUNT_NAME}] {msg}")
 
 
 def announce(msg=""):
     """Batch-level output that belongs to no single account."""
-    print(msg, flush=True)
+    VIEW.log(msg)
 
 
 def log(msg):
@@ -467,11 +478,21 @@ def ask(title, prompt, help_lines=(), check=None):
 
 def confirm(title, rows, action, warning=""):
     """Show what is about to happen and let the user back out."""
-    header = [""] + [f"    {dim(label + ':'):<24} {value}" for label, value in rows]
+    width = max((len(label) for label, _ in rows if label), default=0)
+    header = [""]
+    for label, value in rows:
+        if label:
+            header.append(f"    {dim(label.ljust(width))}   {value}")
+        elif value:
+            header.append(f"    {dim(value)}")
+        else:
+            header.append("")
     if warning:
-        header += ["", f"  {yellow(warning)}"]
+        header += [f"  {yellow(warning)}"]
     header += [""]
-    chosen = select(title, [action, "Back"], hints={0: warning}, header=header)
+    chosen = select(title, [action, "Back"],
+                    hints={1: "Return to the menu without running anything"},
+                    header=header)
     return chosen == 0
 
 
@@ -1112,7 +1133,7 @@ def menu_rows(cfg, names):
     diff_label = (
         "All"
         if set(diffs) >= set(DIFFICULTIES)
-        else "+".join(DIFF_LABEL[d] for d in DIFFICULTIES if d in diffs)
+        else "+".join(diff_colour(DIFF_LABEL[d]) for d in DIFFICULTIES if d in diffs)
     )
     count_label = "Random, 1-9" if cfg["count"] is None else str(cfg["count"])
     timing_label = "Human-like" if cfg["timing"] == "human" else "Instant"
@@ -1130,6 +1151,10 @@ def menu_rows(cfg, names):
         ("telegram", "Telegram alerts", "when a run finishes"),
         ("quit", "Quit", ""),
     ]
+
+
+def diff_colour(name):
+    return {"Easy": green, "Medium": yellow, "Hard": red}.get(name, dim)(name)
 
 
 def run_menu(cfg):
@@ -1177,7 +1202,7 @@ def _menu_action(key, cfg, names):
         diffs = cfg["difficulties"]
         res = checkbox(
             "Which difficulties?",
-            [DIFF_LABEL[d] for d in DIFFICULTIES],
+            [diff_colour(DIFF_LABEL[d]) for d in DIFFICULTIES],
             [d in diffs for d in DIFFICULTIES],
         )
         if res:
@@ -1293,10 +1318,13 @@ def _wait_until(deadline):
                 remaining = max(0, deadline - time.time())
                 shown_second = math.ceil(remaining)
                 if shown_second != last_second:
-                    sys.stdout.write(
-                        "\r\x1b[2K" + dim(_countdown_line(remaining, total))
-                    )
-                    sys.stdout.flush()
+                    if VIEW.active:
+                        VIEW.countdown(remaining, total, "· press s to skip")
+                    else:
+                        sys.stdout.write(
+                            "\r\x1b[2K" + dim(_countdown_line(remaining, total))
+                        )
+                        sys.stdout.flush()
                     last_second = shown_second
                 if remaining <= 0:
                     completed = True
@@ -1309,12 +1337,15 @@ def _wait_until(deadline):
                     if os.read(sys.stdin.fileno(), 1).lower() == b"s":
                         return True
     finally:
-        if completed:
+        if VIEW.active:
+            VIEW.clear_countdown()
+        elif completed:
             sys.stdout.write("\n")
         else:
             # Remove a partial countdown before printing a skip/stop message.
             sys.stdout.write("\r\x1b[2K")
-        sys.stdout.flush()
+        if not VIEW.active:
+            sys.stdout.flush()
 
 
 def wait_before_next_question(cfg):
@@ -1397,6 +1428,7 @@ def run_session(ctx, cfg, session_id, result):
     random.shuffle(pool)
     n = result.target
     say(bold(f"Today's target: {n} problem{'s' if n != 1 else ''}"))
+    VIEW.target(n)
     log(f"Solving {n} problems, {len(pool)} candidates; timing={cfg['timing']}.")
     attempts = 0
     current_attempt_id = current_attempt_started = None
@@ -1405,6 +1437,7 @@ def run_session(ctx, cfg, session_id, result):
     def stage(value):
         nonlocal current_stage
         current_stage = value
+        VIEW.stage(STAGE_TEXT.get(value, value.lower()))
         reporting.update_attempt_stage(HISTORY_DB, current_attempt_id, value)
 
     def finish_current(outcome, reason="", status_message="", runtime="", submission_id=""):
@@ -1432,6 +1465,8 @@ def run_session(ctx, cfg, session_id, result):
             say()
             say(bold(f"[{result.done + 1}/{n}] #{q['frontendQuestionId']} {name}"
                      f" · {q['difficulty'].title()}"))
+            VIEW.problem(result.done + 1, n, q["frontendQuestionId"], name,
+                         q["difficulty"].title())
             say(dim("  fetching solution from walkccc.me ..."))
             code = get_python_solution(source_page, q["frontendQuestionId"])
             stage("Problem metadata")
@@ -1478,6 +1513,7 @@ def run_session(ctx, cfg, session_id, result):
                     finish_current("Accepted", status_message=status_message,
                                    runtime=rt, submission_id=submission_id)
                     result.done += 1
+                    VIEW.accepted(result.done)
                     result.accepted.append(name)
                     solved.append(str(q["frontendQuestionId"]))
                     save_solved(solved)
@@ -1708,13 +1744,32 @@ def wants_menu(args):
     )
 
 
+def plan_rows(cfg, names):
+    """Say what the run will do before it starts, and roughly how long."""
+    rows, notes = dashboard.plan_lines(
+        names, cfg["count"], cfg["difficulties"], cfg["timing"]
+    )
+    shown = [(name, detail) for name, detail in rows]
+    if len(names) > 1:
+        shown.append(("order", " → ".join(names)))
+    return shown + [("", "")] + [("", note) for note in notes]
+
+
 def run_interactive(args):
     cfg = {**session_config(args), "interactive": True, "accounts": [ACCOUNT_NAME]}
-    cfg = run_menu(cfg)
-    if cfg is None:
-        say(dim("bye"))
-        return 0
-    return run_accounts(cfg)
+    while True:
+        cfg = run_menu(cfg)
+        if cfg is None:
+            say(dim("bye"))
+            return 0
+        names = cfg.get("accounts") or [ACCOUNT_NAME]
+        if confirm(
+            "Ready to run",
+            plan_rows(cfg, names),
+            "Start now",
+            "This submits accepted solutions to LeetCode.",
+        ):
+            return run_accounts(cfg)
 
 
 def outcome_label(code):
@@ -1737,8 +1792,20 @@ def report_batch(results):
 
 def run_accounts(cfg):
     """Run the chosen accounts in turn, holding one account's lock at a time."""
+    global VIEW
     names = cfg.get("accounts") or [ACCOUNT_NAME]
+    view = dashboard.build(names) if cfg.get("interactive") else dashboard.NullView()
+    previous, VIEW = VIEW, view
+    try:
+        with view:
+            return _run_accounts(cfg, names, view)
+    finally:
+        VIEW = previous
+
+
+def _run_accounts(cfg, names, view):
     if len(names) == 1:
+        view.account(names[0], 1, 1)
         return run_one_account(names[0], cfg)
     announce(bold(f"Running {len(names)} accounts, one after another: {', '.join(names)}"))
     announce(dim("Each finishes its own problems before the next one starts."))
@@ -1749,6 +1816,7 @@ def run_accounts(cfg):
             continue
         announce("")
         announce(bold(f"─── {position}/{len(names)} · {name} ───"))
+        view.account(name, position, len(names))
         try:
             code = run_one_account(name, {**cfg, "batch_child": True})
         except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:

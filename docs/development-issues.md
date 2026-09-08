@@ -143,6 +143,13 @@ Because the menu can switch accounts, it runs before any account lock is taken,
 and each account is locked only while its own session runs. A menu run of several
 accounts reuses the batch stop rules rather than defining new ones.
 
+The run view is a Rich panel held open for the whole batch, with account
+switches and problem progress pushed into it from the existing session loop
+rather than by restructuring that loop. It degrades to the previous plain
+output whenever Rich is missing or output is not a terminal, so Hermes logs are
+unchanged. Estimates shown before a run are a range built from the configured
+gap bounds; they are not measured timings.
+
 Automated validation uses isolated fixtures and mocked submissions. Logging into
 the two real additional accounts and verifying their usernames remains a manual
 acceptance step; no successful live multi-account run is claimed here.

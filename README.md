@@ -27,6 +27,25 @@ run will use:
 
 Every row explains itself at the bottom of the screen as you move through it.
 
+**Start run** does not begin immediately. It first shows the plan — which
+accounts run and in what order, how many problems each will attempt, and a
+rough time range — so nothing starts before you have seen what it involves:
+
+```
+    default    6 problems
+    jaagrett   6 problems
+    order      default → jaagrett
+
+    12 problems · easy · human-like pacing
+    roughly 38 min – 2 h 8 min
+```
+
+During the run a panel stays pinned below the log showing the current account
+and its position in the queue, accepted-so-far against the target, the problem
+being worked on, the current step, and a live countdown to the next question.
+Log lines scroll above it. Runs without a terminal — cron and Hermes — keep the
+plain line-per-event output the log files expect.
+
 The same actions are available as `--account NAME --setup` and
 `--account NAME` for scripted use. The existing account remains `default`, with
 its profile and history unchanged. Hermes can run all accounts sequentially with
