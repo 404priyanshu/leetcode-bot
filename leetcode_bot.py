@@ -808,6 +808,44 @@ def _launch(p, offscreen=False):
     )
 
 
+def register_account_if_needed(name):
+    """Bind a named account to its expected username before the first login."""
+    if name == "default":
+        return
+    existing = (
+        accounts.expected_username(name)
+        if accounts.paths(name)["identity"].exists() else None
+    )
+    if existing is None:
+        accounts.register(name, input("Expected LeetCode username for this account: "))
+    else:
+        say(f"Log in as {existing}; other usernames will be rejected.")
+
+
+def account_setup(name):
+    """Register if needed and log in with every path bound to that account."""
+    previous = ACCOUNT_NAME
+    try:
+        configure_account(name)
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_run(LOCK_FILE):
+            register_account_if_needed(name)
+            setup_login()
+    finally:
+        configure_account(previous)
+
+
+def add_account():
+    """Ask for a new account name from the menu, then log into it."""
+    name = accounts.validate_name(
+        input("New account name (lowercase, e.g. jaagrett): ").strip().lower()
+    )
+    if name in accounts.list_accounts():
+        raise ValueError(f"Account {name} already exists; pick another name.")
+    account_setup(name)
+    return name
+
+
 def setup_login():
     if os.name == "nt":
         from windows.login import manual_login
@@ -885,48 +923,74 @@ def run_menu(cfg):
         )
         count_label = "Random (human-like)" if cfg["count"] is None else str(cfg["count"])
         timing_label = "Human-like" if cfg["timing"] == "human" else "Instant"
+        names = cfg.get("accounts") or [ACCOUNT_NAME]
+        account_label = (
+            names[0] if len(names) == 1
+            else f"{len(names)} accounts ({', '.join(names)})"
+        )
         options = [
-            f"{'Start run':<12} {diff_label} · {count_label} · {timing_label}",
+            f"{'Start run':<12} {account_label} · {diff_label} · {count_label} · {timing_label}",
+            f"{'Accounts':<12} {account_label}",
             f"{'Difficulty':<12} {diff_label}",
             f"{'Problems':<12} {count_label}",
             f"{'Timing':<12} {timing_label}",
+            f"{'Add account':<12} register another LeetCode login",
             f"{'Log in':<12} one-time LeetCode setup",
             f"{'Telegram':<12} configure notifications",
             "Quit",
         ]
         i = select("LeetCode Bot", options)
-        if i in (None, 6):
+        if i in (None, 8):
             return None
         if i == 0:
             return cfg
-        if i == 1:
-            res = checkbox(
-                "Difficulty",
-                [DIFF_LABEL[d] for d in DIFFICULTIES],
-                [d in diffs for d in DIFFICULTIES],
-            )
-            if res:
-                cfg = {
-                    **cfg,
-                    "difficulties": tuple(
-                        d for d, on in zip(DIFFICULTIES, res) if on
-                    ),
-                }
-        elif i == 2:
-            res = select(
-                "Problems per run",
-                ["Random (human-like, 1-9)"] + [str(x) for x in range(1, 11)],
-            )
-            if res is not None:
-                cfg = {**cfg, "count": None if res == 0 else res}
-        elif i == 3:
-            res = select("Timing", ["Human-like (3-12 min gaps)", "Instant (no waits)"])
-            if res is not None:
-                cfg = {**cfg, "timing": ("human", "instant")[res]}
-        elif i == 4:
-            setup_login()
-        elif i == 5:
-            setup_telegram()
+        try:
+            cfg = _menu_action(i, cfg, diffs, names)
+        except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:
+            say(red(f"✗ {error}"))
+        except (KeyboardInterrupt, EOFError):
+            say(yellow("cancelled"))
+
+
+def _menu_action(i, cfg, diffs, names):
+    """Apply one menu choice and return the updated config."""
+    if i == 1:
+        known = accounts.list_accounts()
+        res = checkbox("Run on accounts", known, [n in names for n in known])
+        if res:
+            return {**cfg, "accounts": [n for n, on in zip(known, res) if on]}
+    elif i == 2:
+        res = checkbox(
+            "Difficulty",
+            [DIFF_LABEL[d] for d in DIFFICULTIES],
+            [d in diffs for d in DIFFICULTIES],
+        )
+        if res:
+            return {
+                **cfg,
+                "difficulties": tuple(d for d, on in zip(DIFFICULTIES, res) if on),
+            }
+    elif i == 3:
+        res = select(
+            "Problems per run",
+            ["Random (human-like, 1-9)"] + [str(x) for x in range(1, 11)],
+        )
+        if res is not None:
+            return {**cfg, "count": None if res == 0 else res}
+    elif i == 4:
+        res = select("Timing", ["Human-like (3-12 min gaps)", "Instant (no waits)"])
+        if res is not None:
+            return {**cfg, "timing": ("human", "instant")[res]}
+    elif i == 5:
+        selected = set(names) | {add_account()}
+        return {**cfg, "accounts": [n for n in accounts.list_accounts() if n in selected]}
+    elif i == 6:
+        chosen = 0 if len(names) == 1 else select("Log in to which account?", names)
+        if chosen is not None:
+            account_setup(names[chosen])
+    elif i == 7:
+        setup_telegram()
+    return cfg
 
 
 # ---------------- solver session -------------------------------------------
@@ -1380,6 +1444,9 @@ def main():
         configure_account(args.account)
         if not args.setup:
             accounts.expected_username(args.account)
+        # The menu can switch accounts, so it runs before any account is locked.
+        if wants_menu(args):
+            return run_interactive(args)
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_run(LOCK_FILE):
             return run_command(args)
@@ -1394,24 +1461,8 @@ def main():
         return 130
 
 
-def run_command(args):
-    if args.setup:
-        if ACCOUNT_NAME != "default":
-            existing = accounts.expected_username(ACCOUNT_NAME) if accounts.paths(ACCOUNT_NAME)["identity"].exists() else None
-            if existing is None:
-                accounts.register(ACCOUNT_NAME, input("Expected LeetCode username for this account: "))
-            else:
-                say(f"Log in as {existing}; other usernames will be rejected.")
-        setup_login()
-        return
-    if args.setup_telegram:
-        setup_telegram()
-        return
-    if args.export_report:
-        reporting.import_historical_solved(HISTORY_DB, load_solved())
-        return 0 if refresh_excel_report(announce=True) else 1
-
-    cfg = {
+def session_config(args):
+    return {
         "difficulties": args.difficulty or ("easy",),
         "count": args.count,
         "timing": "instant" if args.instant else "human",
@@ -1421,21 +1472,73 @@ def run_command(args):
         "batch_child": getattr(args, "batch_child", False),
     }
 
-    # Bare run in a terminal opens the menu; any run flags go straight to work.
-    menu_ok = (
-        not args.no_menu
+
+def wants_menu(args):
+    """A bare run in a terminal opens the menu; flags go straight to work."""
+    return (
+        not (args.setup or args.setup_telegram or args.export_report)
+        and not args.no_menu
         and sys.stdin.isatty()
         and sys.stdout.isatty()
         and not (args.count or args.instant or args.difficulty)
     )
-    if menu_ok:
-        cfg["interactive"] = True
-        cfg = run_menu(cfg)
-        if cfg is None:
-            say(dim("bye"))
-            return
 
-    return execute_session(cfg)
+
+def run_interactive(args):
+    cfg = {**session_config(args), "interactive": True, "accounts": [ACCOUNT_NAME]}
+    cfg = run_menu(cfg)
+    if cfg is None:
+        say(dim("bye"))
+        return 0
+    return run_accounts(cfg)
+
+
+def run_accounts(cfg):
+    """Run the chosen accounts in turn, holding one account's lock at a time."""
+    names = cfg.get("accounts") or [ACCOUNT_NAME]
+    if len(names) == 1:
+        return run_one_account(names[0], cfg)
+    outcomes, stop = [], False
+    for name in names:
+        if stop:
+            outcomes.append(f"{name}: skipped")
+            continue
+        try:
+            code = run_one_account(name, {**cfg, "batch_child": True})
+        except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:
+            say(red(f"✗ {error}"))
+            code = 1
+        outcomes.append(
+            f"{name}: " + ("completed" if code == 0 else f"failed (exit {code})")
+        )
+        # A shared failure or an interruption stops the remaining accounts.
+        stop = code in (75, 130)
+    say("; ".join(outcomes))
+    if any("exit 130" in item for item in outcomes):
+        return 130
+    return 0 if all(item.endswith(": completed") for item in outcomes) else 1
+
+
+def run_one_account(name, cfg):
+    configure_account(name)
+    accounts.expected_username(name)
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive_run(LOCK_FILE):
+        return execute_session(cfg)
+
+
+def run_command(args):
+    if args.setup:
+        register_account_if_needed(ACCOUNT_NAME)
+        setup_login()
+        return
+    if args.setup_telegram:
+        setup_telegram()
+        return
+    if args.export_report:
+        reporting.import_historical_solved(HISTORY_DB, load_solved())
+        return 0 if refresh_excel_report(announce=True) else 1
+    return execute_session(session_config(args))
 
 
 if __name__ == "__main__":

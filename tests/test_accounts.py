@@ -22,6 +22,11 @@ class AccountTests(unittest.TestCase):
         self.storage = patch.object(accounts, 'storage_root', return_value=self.root)
         self.storage.start()
         self.addCleanup(self.storage.stop)
+        for attribute in ('ACCOUNT_NAME', 'PROFILE_DIR', 'SOLVED_FILE', 'LOG_FILE',
+                          'STATE_FILE', 'HISTORY_DB', 'REPORT_FILE', 'LOCK_FILE'):
+            keep = patch.object(bot, attribute, getattr(bot, attribute))
+            keep.start()
+            self.addCleanup(keep.stop)
 
     def test_separate_paths_and_default_history_unchanged(self):
         self.assertEqual(accounts.paths('default')['data'], self.root)
@@ -109,6 +114,108 @@ class AccountTests(unittest.TestCase):
         with exclusive_run(accounts.paths('account2')['lock']):
             with exclusive_run(accounts.paths('account3')['lock']):
                 pass
+
+    def test_list_accounts_orders_default_first_and_ignores_strays(self):
+        for name in ('account3', 'account2'):
+            accounts.register(name, name + 'user')
+        (self.root / 'accounts' / 'halfway').mkdir(parents=True)
+        (self.root / 'accounts' / 'Bad Name').mkdir(parents=True)
+        self.assertEqual(accounts.list_accounts(), ['default', 'account2', 'account3'])
+
+    def menu(self, choices, checks=(), answers=()):
+        with patch.object(bot, 'select', side_effect=list(choices)), \
+                patch.object(bot, 'checkbox', side_effect=list(checks)), \
+                patch('builtins.input', side_effect=list(answers)), \
+                patch.object(bot, 'setup_login'):
+            return bot.run_menu({'difficulties': ('easy',), 'count': 1, 'timing': 'instant',
+                                 'interactive': True, 'accounts': ['default']})
+
+    def test_menu_selects_several_accounts_to_run(self):
+        for name in ('account2', 'account3'):
+            accounts.register(name, name + 'user')
+        cfg = self.menu(choices=[1, 0], checks=[[True, True, False]])
+        self.assertEqual(cfg['accounts'], ['default', 'account2'])
+
+    def test_menu_adds_account_and_includes_it_in_the_run(self):
+        cfg = self.menu(choices=[5, 0], answers=['Jaagrett', 'Jaagrett'])
+        self.assertEqual(cfg['accounts'], ['default', 'jaagrett'])
+        self.assertEqual(accounts.expected_username('jaagrett'), 'Jaagrett')
+
+    def test_menu_reports_bad_account_input_and_stays_open(self):
+        accounts.register('account2', 'alice')
+        with patch.object(bot, 'say') as say:
+            cfg = self.menu(choices=[5, 0], answers=['account2'])
+        self.assertEqual(cfg['accounts'], ['default'])
+        self.assertIn('already exists', ' '.join(str(c.args[0]) for c in say.call_args_list))
+
+    def test_menu_login_targets_the_selected_account(self):
+        accounts.register('account2', 'alice')
+        with patch.object(bot, 'select', side_effect=[6, 0]), \
+                patch.object(bot, 'account_setup') as setup:
+            bot.run_menu({'difficulties': ('easy',), 'count': 1, 'timing': 'instant',
+                          'interactive': True, 'accounts': ['account2']})
+        setup.assert_called_once_with('account2')
+
+    def sessions(self, codes):
+        seen = []
+
+        def session(cfg):
+            seen.append((bot.ACCOUNT_NAME, cfg.get('batch_child', False)))
+            return codes[len(seen) - 1]
+
+        return seen, session
+
+    def test_run_accounts_switches_account_per_session(self):
+        for name in ('account2', 'account3'):
+            accounts.register(name, name + 'user')
+        seen, session = self.sessions([0, 0, 0])
+        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'):
+            code = bot.run_accounts({'accounts': ['default', 'account2', 'account3']})
+        self.assertEqual((code, [name for name, _ in seen]), (0, ['default', 'account2', 'account3']))
+        self.assertTrue(all(child for _, child in seen))
+
+    def test_run_accounts_continues_past_one_failure_but_stops_on_shared(self):
+        for name in ('account2', 'account3'):
+            accounts.register(name, name + 'user')
+        seen, session = self.sessions([1, 0, 0])
+        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say') as say:
+            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 1)
+        self.assertEqual(len(seen), 3)
+        seen, session = self.sessions([75, 0, 0])
+        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say') as say:
+            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 1)
+        self.assertEqual(len(seen), 1)
+        self.assertIn('account3: skipped', ' '.join(str(c.args[0]) for c in say.call_args_list))
+
+    def test_run_accounts_single_keeps_plain_exit_code(self):
+        seen, session = self.sessions([130])
+        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'):
+            self.assertEqual(bot.run_accounts({'accounts': ['default']}), 130)
+        self.assertEqual(seen, [('default', False)])
+
+    def test_run_accounts_reports_a_locked_account_and_carries_on(self):
+        accounts.register('account2', 'alice')
+        seen, session = self.sessions([0])
+        with exclusive_run(accounts.paths('default')['lock']), \
+                patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say') as say:
+            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2']}), 1)
+        self.assertEqual([name for name, _ in seen], ['account2'])
+        self.assertIn('account2: completed', ' '.join(str(c.args[0]) for c in say.call_args_list))
+
+    def options(self, **overrides):
+        chosen = dict(setup=False, setup_telegram=False, export_report=False,
+                      no_menu=False, count=None, instant=False, difficulty=None)
+        chosen.update(overrides)
+        return argparse.Namespace(**chosen)
+
+    def test_wants_menu_only_for_a_bare_interactive_run(self):
+        terminal = Mock(isatty=Mock(return_value=True))
+        with patch.object(bot.sys, 'stdin', terminal), patch.object(bot.sys, 'stdout', terminal):
+            self.assertTrue(bot.wants_menu(self.options()))
+            for overrides in (dict(setup=True), dict(setup_telegram=True), dict(export_report=True),
+                              dict(no_menu=True), dict(count=2), dict(instant=True),
+                              dict(difficulty=('easy',))):
+                self.assertFalse(bot.wants_menu(self.options(**overrides)))
 
     def batch(self, codes):
         with patch.object(run_daily, 'ROOT', self.root), patch.object(run_daily, 'run_account', side_effect=codes) as run:

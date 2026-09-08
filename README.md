@@ -13,9 +13,19 @@ outcomes, see the [development issue log](docs/development-issues.md).
 
 ## Multiple accounts
 
-Use `--account NAME --setup` to register additional logins. The existing account
-remains `default`, with its profile and history unchanged. Hermes can run all
-accounts sequentially with one command; see [three-account setup](windows/README.md#three-accounts-with-hermes).
+Run the bot with no flags to open the menu, which adds accounts and picks which
+ones to run:
+
+- **Add account** asks for a name and the expected LeetCode username, then opens
+  the browser so you can log in.
+- **Accounts** selects one account or several with Space; a multi-account run
+  works through them one at a time.
+- **Log in** repeats setup for the selected account.
+
+The same actions are available as `--account NAME --setup` and
+`--account NAME` for scripted use. The existing account remains `default`, with
+its profile and history unchanged. Hermes can run all accounts sequentially with
+one command; see [three-account setup](windows/README.md#three-accounts-with-hermes).
 Each account has separate progress and an expected-username check.
 
 ## Requirements

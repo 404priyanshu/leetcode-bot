@@ -30,6 +30,21 @@ def paths(name):
                 lock=(root / '.leetcode-bot.lock' if os.name == 'nt' else BASE / '.bot.lock') if default else data / '.bot.lock')
 
 
+def list_accounts():
+    """Known accounts: the original one first, then registered named accounts."""
+    root = storage_root() / 'accounts'
+    named = []
+    if root.is_dir():
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or not (entry / 'account.json').is_file():
+                continue
+            try:
+                named.append(validate_name(entry.name))
+            except ValueError:
+                continue  # a stray directory is not an account
+    return ['default'] + named
+
+
 def expected_username(name):
     path = paths(name)['identity']
     if not path.exists():

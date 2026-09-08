@@ -138,6 +138,11 @@ the batch; switching accounts is not used to continue through blocking. Startup
 jitter runs once, and there are no automatic submission retries. Manual Windows
 setup continues using ordinary Chrome, preserving the confirmed verification fix.
 
+The interactive menu adds and selects accounts so the flags are not required.
+Because the menu can switch accounts, it runs before any account lock is taken,
+and each account is locked only while its own session runs. A menu run of several
+accounts reuses the batch stop rules rather than defining new ones.
+
 Automated validation uses isolated fixtures and mocked submissions. Logging into
 the two real additional accounts and verifying their usernames remains a manual
 acceptance step; no successful live multi-account run is claimed here.

@@ -158,7 +158,18 @@ Power references: [powercfg options](https://learn.microsoft.com/en-us/windows-h
 The original account is named `default`. Existing commands, its Chrome profile,
 and its progress files stay in place; you do not need to log in again.
 
-Register each additional account from PowerShell:
+Register each additional account from the menu, by running the bot with no
+flags and choosing **Add account**:
+
+```powershell
+.\.venv\Scripts\python.exe leetcode_bot.py
+```
+
+The menu's **Accounts** entry then selects which accounts a run uses, and
+**Log in** repeats setup for one of them. A menu run works through the selected
+accounts one at a time, using the same stop rules as the Hermes batch below.
+
+The equivalent commands, for scripting or a session without a terminal:
 
 ```powershell
 .\.venv\Scripts\python.exe leetcode_bot.py --account account2 --setup
