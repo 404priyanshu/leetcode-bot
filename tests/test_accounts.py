@@ -290,10 +290,23 @@ class AccountTests(unittest.TestCase):
                               dict(difficulty=('easy',))):
                 self.assertFalse(bot.wants_menu(self.options(**overrides)))
 
-    def batch(self, codes):
+    def batch(self, codes, **options):
         with patch.object(run_daily, 'ROOT', self.root), patch.object(run_daily, 'run_account', side_effect=codes) as run:
-            result = run_daily.run_batch(['default', 'account2', 'account3'], ['--count', '1'])
+            result = run_daily.run_batch(['default', 'account2', 'account3'], ['--count', '1'], **options)
         return result, run
+
+    def test_no_jitter_starts_every_account_at_the_scheduled_time(self):
+        code, run = self.batch([0, 0, 0], jitter=False)
+        self.assertEqual(code, 0)
+        self.assertEqual([c.kwargs['skip_jitter'] for c in run.call_args_list], [True, True, True])
+
+    def test_no_jitter_flag_reaches_the_batch(self):
+        for argv, expected in ((['runner'], True), (['runner', '--no-jitter'], False)):
+            with patch.object(run_daily.sys, 'argv', argv), \
+                    patch.object(run_daily, 'run_batch', return_value=0) as batch, \
+                    patch.object(run_daily.accounts, 'storage_root', return_value=self.root):
+                self.assertEqual(run_daily.main(), 0)
+            self.assertEqual(batch.call_args.kwargs['jitter'], expected)
 
     def test_sequential_order_and_single_jitter(self):
         code, run = self.batch([0, 0, 0])

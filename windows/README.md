@@ -202,6 +202,17 @@ paths as shown earlier):
 .\.venv\Scripts\python.exe windows\run_daily.py --accounts default account2 account3 --count 1 --difficulty easy
 ```
 
+By default the first account waits a random delay of up to three hours after the
+scheduled time, so the run does not begin at the same minute every day. Add
+`--no-jitter` when the run must start when the scheduler fires:
+
+```powershell
+.\.venv\Scripts\python.exe windows\run_daily.py --accounts default account2 --count 1 --no-jitter
+```
+
+That trades the delay for punctuality: a run that starts at exactly the same
+time daily is easier to recognise as automated.
+
 The count applies **to each account**, so this targets three accepted solutions
 total. Each account independently chooses unsolved questions; accounts may choose
 the same question. Omit count/difficulty to keep one easy question per account.

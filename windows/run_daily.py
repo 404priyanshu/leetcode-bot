@@ -63,7 +63,7 @@ def run_account(name, arguments, skip_jitter):
         return code
 
 
-def run_batch(names, arguments):
+def run_batch(names, arguments, jitter=True):
     log_dir = ROOT / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)
     with (log_dir / f'batch-{datetime.now():%Y-%m-%d}.log').open('a', encoding='utf-8', buffering=1) as output:
@@ -73,7 +73,7 @@ def run_batch(names, arguments):
             if stop:
                 outcome = f'{name}: skipped'
             else:
-                code = run_account(name, arguments, skip_jitter=index > 0)
+                code = run_account(name, arguments, skip_jitter=index > 0 or not jitter)
                 outcome = f'{name}: ' + ('completed' if code == 0 else f'failed (exit {code})')
                 stop = code in (75, 130) or code < 0
             outcomes.append(outcome)
@@ -95,6 +95,9 @@ def main():
     parser.add_argument('--difficulty', type=parse_difficulty, default=('easy',))
     parser.add_argument('--instant', action='store_true')
     parser.add_argument('--visible-browser', action='store_true')
+    parser.add_argument('--no-jitter', action='store_true',
+                        help='start at the scheduled time instead of up to '
+                             '3 hours later; makes the daily run easier to spot')
     args = parser.parse_args()
     names = args.accounts or [args.account or 'default']
     try:
@@ -110,7 +113,7 @@ def main():
         lock = accounts.storage_root() / '.batch.lock'
         lock.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_run(lock):
-            return run_batch(names, arguments)
+            return run_batch(names, arguments, jitter=not args.no_jitter)
     except (ValueError, OSError, AlreadyRunning) as error:
         print(str(error), file=sys.stderr)
         return 1
