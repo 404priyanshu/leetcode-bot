@@ -228,14 +228,33 @@ class AccountTests(unittest.TestCase):
         for name in ('account2', 'account3'):
             accounts.register(name, name + 'user')
         seen, session = self.sessions([1, 0, 0])
-        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say') as say:
+        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'), \
+                patch.object(bot, 'announce'):
             self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 1)
         self.assertEqual(len(seen), 3)
         seen, session = self.sessions([75, 0, 0])
-        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say') as say:
+        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'), \
+                patch.object(bot, 'announce') as announce:
             self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 1)
         self.assertEqual(len(seen), 1)
-        self.assertIn('account3: skipped', ' '.join(str(c.args[0]) for c in say.call_args_list))
+        printed = ' '.join(str(c.args[0]) for c in announce.call_args_list if c.args)
+        self.assertIn('skipped — default hit a shared block', printed)
+
+    def test_batch_output_names_each_account_as_it_starts(self):
+        for name in ('account2', 'account3'):
+            accounts.register(name, name + 'user')
+        seen, session = self.sessions([0, 130, 0])
+        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'), \
+                patch.object(bot, 'announce') as announce:
+            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 130)
+        printed = [str(c.args[0]) for c in announce.call_args_list if c.args]
+        self.assertIn('1/3 · default', ' '.join(printed))
+        self.assertIn('2/3 · account2', ' '.join(printed))
+        self.assertTrue(any('one after another' in line for line in printed))
+        summary = printed[printed.index(next(l for l in printed if 'Summary' in l)):]
+        self.assertTrue(any('completed' in line for line in summary))
+        self.assertTrue(any('stopped by user' in line for line in summary))
+        self.assertTrue(any('skipped — you stopped the run' in line for line in summary))
 
     def test_run_accounts_single_keeps_plain_exit_code(self):
         seen, session = self.sessions([130])
@@ -247,10 +266,14 @@ class AccountTests(unittest.TestCase):
         accounts.register('account2', 'alice')
         seen, session = self.sessions([0])
         with exclusive_run(accounts.paths('default')['lock']), \
-                patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say') as say:
+                patch.object(bot, 'execute_session', side_effect=session), \
+                patch.object(bot, 'say') as say, patch.object(bot, 'announce') as announce:
             self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2']}), 1)
         self.assertEqual([name for name, _ in seen], ['account2'])
-        self.assertIn('account2: completed', ' '.join(str(c.args[0]) for c in say.call_args_list))
+        self.assertIn('is using this profile',
+                      ' '.join(str(c.args[0]) for c in say.call_args_list))
+        printed = ' '.join(str(c.args[0]) for c in announce.call_args_list if c.args)
+        self.assertIn('completed', printed)
 
     def options(self, **overrides):
         chosen = dict(setup=False, setup_telegram=False, export_report=False,

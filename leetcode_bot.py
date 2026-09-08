@@ -151,6 +151,11 @@ def say(msg=""):
     print(f"[{ACCOUNT_NAME}] {msg}", flush=True)
 
 
+def announce(msg=""):
+    """Batch-level output that belongs to no single account."""
+    print(msg, flush=True)
+
+
 def log(msg):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{ACCOUNT_NAME}] [{date.today()} {time.strftime('%H:%M:%S')}] {msg}\n")
@@ -1712,30 +1717,53 @@ def run_interactive(args):
     return run_accounts(cfg)
 
 
+def outcome_label(code):
+    if code == 0:
+        return green("completed")
+    if code == 130:
+        return yellow("stopped by user")
+    if code == 75:
+        return yellow("stopped — network, Cloudflare or rate limit")
+    return red(f"failed (exit {code})")
+
+
+def report_batch(results):
+    width = max(len(name) for name, _, _ in results)
+    announce("")
+    announce(bold("Summary"))
+    for name, _, label in results:
+        announce(f"  {name.ljust(width)}  {label}")
+
+
 def run_accounts(cfg):
     """Run the chosen accounts in turn, holding one account's lock at a time."""
     names = cfg.get("accounts") or [ACCOUNT_NAME]
     if len(names) == 1:
         return run_one_account(names[0], cfg)
-    outcomes, stop = [], False
-    for name in names:
-        if stop:
-            outcomes.append(f"{name}: skipped")
+    announce(bold(f"Running {len(names)} accounts, one after another: {', '.join(names)}"))
+    announce(dim("Each finishes its own problems before the next one starts."))
+    results, stopped = [], ""
+    for position, name in enumerate(names, 1):
+        if stopped:
+            results.append((name, None, yellow(f"skipped — {stopped}")))
             continue
+        announce("")
+        announce(bold(f"─── {position}/{len(names)} · {name} ───"))
         try:
             code = run_one_account(name, {**cfg, "batch_child": True})
         except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:
             say(red(f"✗ {error}"))
             code = 1
-        outcomes.append(
-            f"{name}: " + ("completed" if code == 0 else f"failed (exit {code})")
-        )
+        results.append((name, code, outcome_label(code)))
         # A shared failure or an interruption stops the remaining accounts.
-        stop = code in (75, 130)
-    say("; ".join(outcomes))
-    if any("exit 130" in item for item in outcomes):
+        if code == 130:
+            stopped = "you stopped the run"
+        elif code == 75:
+            stopped = f"{name} hit a shared block"
+    report_batch(results)
+    if any(code == 130 for _, code, _ in results):
         return 130
-    return 0 if all(item.endswith(": completed") for item in outcomes) else 1
+    return 0 if all(code == 0 for _, code, _ in results) else 1
 
 
 def run_one_account(name, cfg):
