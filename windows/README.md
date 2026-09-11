@@ -215,9 +215,12 @@ time daily is easier to recognise as automated.
 
 The count applies **to each account**, so this targets three accepted solutions
 total. Each account independently chooses unsolved questions; accounts may choose
-the same question. Omit count/difficulty to keep one easy question per account.
-The runner validates all names up front, runs them sequentially, and applies
-startup jitter only to the first child. Other human-mode pauses remain enabled.
+the same question. Omit `--count` to let each account use the bot's built-in
+random daily target; omit `--difficulty` to keep the default easy difficulty.
+The runner validates all names up front and uses one scheduler process to rotate
+eligible accounts after each problem attempt. Only one browser profile runs at
+a time. Startup jitter applies once before the rotation; per-account human-mode
+cooldowns remain enabled, and another eligible account runs instead of idling.
 `--instant` skips all waits. Separate account locks prevent profile collisions;
 a shared batch lock prevents overlapping Hermes wrappers.
 

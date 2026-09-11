@@ -70,9 +70,18 @@ def plan_lines(names, per_account, difficulties, timing):
 
 
 class NullView:
-    """No dashboard: messages print as they always did."""
+    """Plain phase lines for pipes, logs, and terminals without Rich."""
 
     active = False
+
+    def __init__(self, names=()):
+        self.names = list(names)
+        self.name = self.names[0] if self.names else ""
+        self.position, self.total_accounts = 1, len(self.names)
+        self.progress = {
+            name: {"done": 0, "target": 0, "state": "Waiting"}
+            for name in self.names
+        }
 
     def log(self, line):
         print(line, flush=True)
@@ -84,19 +93,73 @@ class NullView:
         return False
 
     def account(self, name, position, total):
-        pass
+        self.name, self.position, self.total_accounts = name, position, total
+        if name not in self.names:
+            self.names.append(name)
+        self.set_state(name, "Running", emit=False)
+        self.log(f"[batch] Now: {name} · account {position} of {total}")
+        self.show_progress()
+
+    def targets(self, targets):
+        for name, target in targets.items():
+            if name not in self.names:
+                self.names.append(name)
+            self.progress.setdefault(name, {"done": 0, "target": 0, "state": "Waiting"})
+            self.progress[name].update(done=0, target=target, state="Waiting")
+        self.show_progress()
 
     def target(self, count):
-        pass
+        if self.name:
+            self.progress.setdefault(
+                self.name, {"done": 0, "target": 0, "state": "Running"}
+            )["target"] = count
+
+    def selecting(self, difficulties):
+        label = "/".join(d.title() for d in difficulties)
+        self.log(f"[{self.name}] Problem: Selecting an unsolved {label} problem")
 
     def problem(self, index, total, number, title, difficulty):
-        pass
+        self.log(f"[{self.name}] Problem: #{number} {title} · {difficulty}")
 
     def stage(self, text):
-        pass
+        self.log(f"[{self.name}] Step: {text}")
 
     def accepted(self, count):
-        pass
+        if self.name:
+            self.progress[self.name]["done"] = count
+
+    def set_state(self, name, state, emit=True):
+        self.progress.setdefault(name, {"done": 0, "target": 0, "state": state})
+        self.progress[name]["state"] = state
+        if emit:
+            self.show_progress()
+
+    def next(self, name, remaining=None, action=None):
+        if action:
+            detail = action
+        elif remaining is None:
+            detail = f"{name} · select its next problem"
+        else:
+            detail = f"{name} in {human_time(remaining)} · all remaining accounts are waiting"
+        self.log(f"[batch] Next: {detail}")
+
+    def waiting(self, name):
+        self.log(f"[batch] Now: no account active · waiting for {name}")
+
+    def complete(self, stopped=False):
+        step = "Run stopped" if stopped else "Run complete"
+        self.log("[batch] Now: no account active")
+        self.log(f"[batch] Step: {step}")
+        self.log("[batch] Next: No further account work scheduled")
+
+    def show_progress(self):
+        parts = []
+        for name in self.names:
+            item = self.progress[name]
+            target = item["target"] or "?"
+            parts.append(f"{name} {item['done']}/{target} {item['state']}")
+        if parts:
+            self.log("[batch] Progress: " + " · ".join(parts))
 
     def countdown(self, remaining, total, hint=""):
         pass
@@ -106,20 +169,20 @@ class NullView:
 
 
 class RunView(NullView):
-    """A panel pinned below the log showing progress and the current step."""
+    """A restrained live panel showing current work and the account queue."""
 
     active = True
 
     def __init__(self, names):
-        self.names = list(names)
+        super().__init__(names)
         self.console = console()
         self.live = None
-        self.name = names[0] if names else ""
-        self.position, self.total_accounts = 1, len(names)
-        self.done = self.want = 0
-        self.current = ""
-        self.step = "starting ..."
-        self.wait = ""
+        self.done = self.want = 0  # compatibility aliases for callers/tests
+        self.now_text = "No account active"
+        self.current = "No problem selected"
+        self.step = "Checking account eligibility"
+        self.next_text = "Targets not assigned yet"
+        self.wait = ""  # compatibility alias for the countdown text
 
     def __enter__(self):
         self.live = Live(self._render(), console=self.console,
@@ -135,26 +198,28 @@ class RunView(NullView):
         return False
 
     def _render(self):
-        head = Table.grid(padding=(0, 1))
-        head.add_column(style="bold cyan")
-        head.add_column(style="dim")
-        where = (f"account {self.position} of {self.total_accounts}"
-                 if self.total_accounts > 1 else "")
-        head.add_row(self.name, where)
-        body = Table.grid(padding=(0, 1))
-        body.add_column()
-        body.add_column()
-        body.add_row(
-            Text(bar(self.done, self.want), style="green"),
-            Text(f"{self.done}/{self.want} accepted" if self.want else "getting ready",
-                 style="bold"),
+        facts = Table.grid(padding=(0, 1))
+        facts.add_column(style="dim", width=9)
+        facts.add_column(ratio=1)
+        facts.add_row("Now", Text(self.now_text, style="cyan"))
+        facts.add_row("Problem", self.current)
+        facts.add_row("Step", Text(self.step, style="bold"))
+        facts.add_row("Next", self.next_text)
+
+        progress = Table.grid(padding=(0, 2))
+        progress.add_column(style="dim", width=max([7] + [len(n) for n in self.names]))
+        progress.add_column(justify="right")
+        progress.add_column()
+        for name in self.names:
+            item = self.progress[name]
+            target = item["target"] or "?"
+            state = item["state"]
+            progress.add_row(name, f"{item['done']}/{target}", state)
+        return Panel(
+            Group(facts, Text("Progress", style="dim"), progress),
+            border_style="bright_black", padding=(0, 1),
+            width=min(self.console.width, 78),
         )
-        rows = [head, body]
-        if self.current:
-            rows.append(self.current)
-        rows.append(Text(self.wait or self.step, style="yellow" if self.wait else "dim"))
-        return Panel(Group(*rows), border_style="cyan", padding=(0, 1),
-                     width=min(self.console.width, 76))
 
     def _refresh(self):
         if self.live:
@@ -168,30 +233,82 @@ class RunView(NullView):
 
     def account(self, name, position, total):
         self.name, self.position, self.total_accounts = name, position, total
-        self.done = self.want = 0
-        self.current, self.wait, self.step = "", "", "starting ..."
+        self.set_state(name, "Running", emit=False)
+        item = self.progress[name]
+        self.done, self.want = item["done"], item["target"]
+        where = f"account {position} of {total}" if total > 1 else "only selected account"
+        self.now_text = f"{name} · {where}"
+        self.current = "Selecting an unsolved problem"
+        self.step = "Opening browser profile"
+        self._refresh()
+
+    def targets(self, targets):
+        for name, target in targets.items():
+            self.progress[name].update(done=0, target=target, state="Waiting")
+        if self.name:
+            item = self.progress[self.name]
+            self.done, self.want = item["done"], item["target"]
         self._refresh()
 
     def target(self, count):
         self.want = count
+        if self.name:
+            self.progress[self.name]["target"] = count
+        self._refresh()
+
+    def selecting(self, difficulties):
+        label = "/".join(d.title() for d in difficulties)
+        self.current = f"Selecting an unsolved {label} problem"
         self._refresh()
 
     def problem(self, index, total, number, title, difficulty):
-        self.current = Text(f"{index}/{total}  #{number} {title} · ")
+        self.current = Text(f"#{number} {title} · ")
         self.current.append(difficulty, style=DIFF_STYLE.get(difficulty, "white"))
         self._refresh()
 
     def stage(self, text):
-        self.step, self.wait = text, ""
+        self.step = text
+        self.wait = ""
         self._refresh()
 
     def accepted(self, count):
         self.done = count
+        if self.name:
+            self.progress[self.name]["done"] = count
         self._refresh()
 
-    def countdown(self, remaining, total, hint=""):
-        minutes, seconds = divmod(int(remaining), 60)
-        self.wait = f"next question in {minutes}:{seconds:02d}  {hint}".rstrip()
+    def set_state(self, name, state, emit=True):
+        self.progress[name]["state"] = state
+        self._refresh()
+
+    def show_progress(self):
+        self._refresh()
+
+    def next(self, name, remaining=None, action=None):
+        if action:
+            self.next_text = action
+        elif remaining is None:
+            self.next_text = f"{name} · select its next problem"
+        else:
+            self.next_text = (
+                f"{name} in {_format_short_countdown(remaining)} · all remaining accounts are waiting"
+            )
+        self._refresh()
+
+    def waiting(self, name):
+        self.now_text = f"No account active · waiting for {name}"
+        self._refresh()
+
+    def complete(self, stopped=False):
+        self.now_text = "No account active"
+        self.step = "Run stopped" if stopped else "Run complete"
+        self.next_text = "No further account work scheduled"
+        self._refresh()
+
+    def countdown(self, remaining, total, hint="", name=None):
+        who = name or "Current account"
+        self.next_text = f"{who} in {_format_short_countdown(remaining)} {hint}".rstrip()
+        self.wait = self.next_text
         self._refresh()
 
     def clear_countdown(self):
@@ -199,5 +316,10 @@ class RunView(NullView):
         self._refresh()
 
 
+def _format_short_countdown(seconds):
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}:{seconds:02d}"
+
+
 def build(names):
-    return RunView(names) if supported() else NullView()
+    return RunView(names) if supported() else NullView(names)

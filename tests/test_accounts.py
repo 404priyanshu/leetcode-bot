@@ -1,4 +1,6 @@
 import argparse
+from contextlib import nullcontext
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -206,74 +208,149 @@ class AccountTests(unittest.TestCase):
     def test_account_with_nothing_saved_is_called_unset(self):
         self.assertIn('not set up yet', bot.account_summary('default')[1])
 
-    def sessions(self, codes):
+    QUEUE_CFG = {
+        'difficulties': ('easy',), 'count': None, 'timing': 'instant',
+        'interactive': True, 'skip_start_jitter': True,
+    }
+
+    def run_queue(self, targets, outcomes, deadlines=None, gap=60, timing='instant'):
+        names = ['default', 'account2']
+        seen, active, max_active = [], 0, 0
+        now = [0.0]
+
+        def turn(name, cfg, target):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            seen.append((name, target))
+            outcome = outcomes.pop(0)
+            active -= 1
+            return outcome
+
+        waits = []
+
+        def wait_until(deadline):
+            waits.append(deadline)
+            now[0] = deadline
+            return False
+
+        view = Mock()
+        with patch.object(bot, 'pick_count', side_effect=targets) as pick, \
+                patch.object(bot, '_account_deadline', side_effect=deadlines or [0, 0]), \
+                patch.object(bot, '_save_account_deadline'):
+            code = bot.run_account_queue(
+                {**self.QUEUE_CFG, 'timing': timing}, names, view, turn_runner=turn,
+                clock=lambda: now[0], waiter=wait_until, gap_picker=lambda: gap,
+            )
+        return code, seen, waits, view, pick.call_count, max_active
+
+    def test_round_robin_order_with_unequal_random_targets_sampled_once(self):
+        accepted = lambda: bot.TurnOutcome(0, accepted=1, status='Completed')
+        code, seen, _, _, samples, _ = self.run_queue(
+            [2, 1], [accepted(), accepted(), accepted()]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [('default', 2), ('account2', 1), ('default', 2)])
+        self.assertEqual(samples, 2)
+
+    def test_explicit_count_applies_to_each_account_without_concurrency(self):
+        outcomes = [bot.TurnOutcome(0, accepted=1) for _ in range(4)]
+        with patch.object(bot, 'pick_count', wraps=bot.pick_count) as pick, \
+                patch.object(bot, '_account_deadline', return_value=0), \
+                patch.object(bot, '_save_account_deadline'):
+            seen, active, peak = [], 0, 0
+
+            def turn(name, cfg, target):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                seen.append((name, target))
+                active -= 1
+                return outcomes.pop(0)
+
+            code = bot.run_account_queue(
+                {**self.QUEUE_CFG, 'count': 2}, ['default', 'account2'], Mock(),
+                turn_runner=turn, gap_picker=lambda: 0,
+            )
+        self.assertEqual((code, peak), (0, 1))
+        self.assertEqual(seen, [('default', 2), ('account2', 2)] * 2)
+        self.assertEqual(pick.call_count, 2)
+
+    def test_each_turn_uses_the_retained_target_without_redrawing(self):
+        result = bot.SessionResult(target=1, done=1, attempts=1, paced=True)
+        with patch.object(bot, 'configure_account'), \
+                patch.object(bot.accounts, 'expected_username'), \
+                patch.object(bot, 'exclusive_run', return_value=nullcontext()), \
+                patch.object(bot, 'execute_session', return_value=(0, result)) as execute, \
+                patch.object(bot, 'pick_count') as pick:
+            outcome = bot.run_one_account_turn(
+                'default', {**self.QUEUE_CFG, 'accepted_before': 2}, 5
+            )
+        pick.assert_not_called()
+        turn_cfg = execute.call_args.args[0]
+        self.assertEqual(
+            (turn_cfg['session_target'], turn_cfg['report_target'],
+             turn_cfg['accepted_before']),
+            (1, 5, 2),
+        )
+        self.assertEqual((outcome.accepted, outcome.attempted), (1, True))
+
+    def test_scheduler_switches_to_eligible_account_before_waiting(self):
+        paced = lambda: bot.TurnOutcome(0, accepted=1, paced=True)
+        code, seen, waits, _, _, _ = self.run_queue(
+            [2, 1], [paced(), paced(), paced()], gap=60, timing='human'
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([name for name, _ in seen[:2]], ['default', 'account2'])
+        self.assertEqual(waits, [60])
+
+    def test_scheduler_waits_for_earliest_account_when_all_are_cooling_down(self):
+        done = bot.TurnOutcome(0, accepted=1)
+        code, seen, waits, view, _, _ = self.run_queue(
+            [1, 1], [done, done], deadlines=[30, 20], timing='human'
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(waits, [20, 30])
+        self.assertEqual([name for name, _ in seen], ['account2', 'default'])
+        self.assertTrue(any(call.args[:2] == ('account2', 20) for call in view.next.call_args_list))
+
+    def test_scheduler_chooses_an_eligible_account_instead_of_waiting(self):
+        done = bot.TurnOutcome(0, accepted=1)
+        code, seen, waits, _, _, _ = self.run_queue(
+            [1, 1], [done, done], deadlines=[60, 0], timing='human'
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([name for name, _ in seen], ['account2', 'default'])
+        self.assertEqual(waits, [60])
+
+    def test_account_failure_continues_but_shared_failure_stops_queue(self):
+        failed = bot.TurnOutcome(1, attempted=False, status='Failed', reason='login expired')
+        done = bot.TurnOutcome(0, accepted=1)
+        code, seen, _, _, _, _ = self.run_queue([1, 1], [failed, done])
+        self.assertEqual((code, [name for name, _ in seen]), (1, ['default', 'account2']))
+
+        shared = bot.TurnOutcome(75, attempted=False, status='Network error')
+        code, seen, _, view, _, _ = self.run_queue([1, 1], [shared])
+        self.assertEqual((code, [name for name, _ in seen]), (1, ['default']))
+        self.assertTrue(any(
+            call.args[:2] == ('account2', 'Failed')
+            for call in view.set_state.call_args_list
+        ))
+
+        interrupted = bot.TurnOutcome(130, attempted=False, status='Interrupted')
+        code, seen, _, _, _, _ = self.run_queue([1, 1], [interrupted])
+        self.assertEqual((code, [name for name, _ in seen]), (130, ['default']))
+
+    def test_run_accounts_single_keeps_plain_exit_code(self):
         seen = []
 
         def session(cfg):
             seen.append((bot.ACCOUNT_NAME, cfg.get('batch_child', False)))
-            return codes[len(seen) - 1]
+            return 130
 
-        return seen, session
-
-    def test_run_accounts_switches_account_per_session(self):
-        for name in ('account2', 'account3'):
-            accounts.register(name, name + 'user')
-        seen, session = self.sessions([0, 0, 0])
-        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'):
-            code = bot.run_accounts({'accounts': ['default', 'account2', 'account3']})
-        self.assertEqual((code, [name for name, _ in seen]), (0, ['default', 'account2', 'account3']))
-        self.assertTrue(all(child for _, child in seen))
-
-    def test_run_accounts_continues_past_one_failure_but_stops_on_shared(self):
-        for name in ('account2', 'account3'):
-            accounts.register(name, name + 'user')
-        seen, session = self.sessions([1, 0, 0])
-        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'), \
-                patch.object(bot, 'announce'):
-            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 1)
-        self.assertEqual(len(seen), 3)
-        seen, session = self.sessions([75, 0, 0])
-        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'), \
-                patch.object(bot, 'announce') as announce:
-            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 1)
-        self.assertEqual(len(seen), 1)
-        printed = ' '.join(str(c.args[0]) for c in announce.call_args_list if c.args)
-        self.assertIn('skipped — default hit a shared block', printed)
-
-    def test_batch_output_names_each_account_as_it_starts(self):
-        for name in ('account2', 'account3'):
-            accounts.register(name, name + 'user')
-        seen, session = self.sessions([0, 130, 0])
-        with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'), \
-                patch.object(bot, 'announce') as announce:
-            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2', 'account3']}), 130)
-        printed = [str(c.args[0]) for c in announce.call_args_list if c.args]
-        self.assertIn('1/3 · default', ' '.join(printed))
-        self.assertIn('2/3 · account2', ' '.join(printed))
-        self.assertTrue(any('one after another' in line for line in printed))
-        summary = printed[printed.index(next(l for l in printed if 'Summary' in l)):]
-        self.assertTrue(any('completed' in line for line in summary))
-        self.assertTrue(any('stopped by user' in line for line in summary))
-        self.assertTrue(any('skipped — you stopped the run' in line for line in summary))
-
-    def test_run_accounts_single_keeps_plain_exit_code(self):
-        seen, session = self.sessions([130])
         with patch.object(bot, 'execute_session', side_effect=session), patch.object(bot, 'say'):
             self.assertEqual(bot.run_accounts({'accounts': ['default']}), 130)
         self.assertEqual(seen, [('default', False)])
-
-    def test_run_accounts_reports_a_locked_account_and_carries_on(self):
-        accounts.register('account2', 'alice')
-        seen, session = self.sessions([0])
-        with exclusive_run(accounts.paths('default')['lock']), \
-                patch.object(bot, 'execute_session', side_effect=session), \
-                patch.object(bot, 'say') as say, patch.object(bot, 'announce') as announce:
-            self.assertEqual(bot.run_accounts({'accounts': ['default', 'account2']}), 1)
-        self.assertEqual([name for name, _ in seen], ['account2'])
-        self.assertIn('is using this profile',
-                      ' '.join(str(c.args[0]) for c in say.call_args_list))
-        printed = ' '.join(str(c.args[0]) for c in announce.call_args_list if c.args)
-        self.assertIn('completed', printed)
 
     def options(self, **overrides):
         chosen = dict(setup=False, setup_telegram=False, export_report=False,
@@ -290,15 +367,20 @@ class AccountTests(unittest.TestCase):
                               dict(difficulty=('easy',))):
                 self.assertFalse(bot.wants_menu(self.options(**overrides)))
 
-    def batch(self, codes, **options):
-        with patch.object(run_daily, 'ROOT', self.root), patch.object(run_daily, 'run_account', side_effect=codes) as run:
-            result = run_daily.run_batch(['default', 'account2', 'account3'], ['--count', '1'], **options)
-        return result, run
+    def batch(self, code=0, **options):
+        process = Mock(stdout=io.StringIO('phase\n'))
+        process.wait.return_value = code
+        with patch.object(run_daily, 'ROOT', self.root), \
+                patch.object(run_daily.subprocess, 'Popen', return_value=process) as launch:
+            result = run_daily.run_batch(
+                ['default', 'account2', 'account3'], ['--count', '1'], **options
+            )
+        return result, launch
 
-    def test_no_jitter_starts_every_account_at_the_scheduled_time(self):
-        code, run = self.batch([0, 0, 0], jitter=False)
+    def test_no_jitter_reaches_the_single_scheduler_process(self):
+        code, launch = self.batch(jitter=False)
         self.assertEqual(code, 0)
-        self.assertEqual([c.kwargs['skip_jitter'] for c in run.call_args_list], [True, True, True])
+        self.assertIn('--skip-start-jitter', launch.call_args.args[0])
 
     def test_no_jitter_flag_reaches_the_batch(self):
         for argv, expected in ((['runner'], True), (['runner', '--no-jitter'], False)):
@@ -308,21 +390,32 @@ class AccountTests(unittest.TestCase):
                 self.assertEqual(run_daily.main(), 0)
             self.assertEqual(batch.call_args.kwargs['jitter'], expected)
 
-    def test_sequential_order_and_single_jitter(self):
-        code, run = self.batch([0, 0, 0])
-        self.assertEqual(code, 0)
-        self.assertEqual([c.args[0] for c in run.call_args_list], ['default', 'account2', 'account3'])
-        self.assertEqual([c.kwargs['skip_jitter'] for c in run.call_args_list], [False, True, True])
+    def test_batch_only_forwards_an_explicit_count(self):
+        cases = (
+            (['runner'], ['--difficulty', 'easy']),
+            (['runner', '--count', '3'], ['--count', '3', '--difficulty', 'easy']),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv), patch.object(run_daily.sys, 'argv', argv), \
+                    patch.object(run_daily, 'run_batch', return_value=0) as batch, \
+                    patch.object(run_daily.accounts, 'storage_root', return_value=self.root):
+                self.assertEqual(run_daily.main(), 0)
+            self.assertEqual(batch.call_args.args[1], expected)
 
-    def test_account_failure_continues_shared_failure_stops(self):
-        code, run = self.batch([1, 0, 0])
-        self.assertEqual((code, run.call_count), (1, 3))
-        for reason in (75, 130, -9):
-            code, run = self.batch([reason])
-            self.assertNotEqual(code, 0)
-            self.assertEqual(run.call_count, 1)
-        log = next((self.root / 'logs').glob('batch-*.log')).read_text()
-        self.assertIn('account3: skipped', log)
+    def test_hermes_launches_one_process_with_accounts_in_order(self):
+        code, launch = self.batch()
+        self.assertEqual(code, 0)
+        command = launch.call_args.args[0]
+        start = command.index('--accounts') + 1
+        self.assertEqual(command[start:start + 3], ['default', 'account2', 'account3'])
+        self.assertIn('--batch-child', command)
+        self.assertNotIn('--skip-start-jitter', command)
+
+    def test_hermes_preserves_scheduler_exit_code(self):
+        for expected in (1, 75, 130):
+            code, launch = self.batch(expected)
+            self.assertEqual(code, expected)
+            self.assertEqual(launch.call_count, 1)
 
     def test_batch_validates_every_account_before_any_launch(self):
         with patch.object(run_daily.sys, 'argv', ['runner', '--accounts', 'default', 'missing']), patch.object(run_daily, 'run_batch') as batch:

@@ -56,16 +56,27 @@ class ViewSelectionTests(unittest.TestCase):
             self.assertFalse(dashboard.supported())
 
     def test_null_view_accepts_every_update_and_prints_logs(self):
-        view = dashboard.NullView()
+        view = dashboard.NullView(['a', 'b'])
+        lines = []
+        view.log = lines.append
         with view:
+            view.targets({'a': 3, 'b': 2})
             view.account('a', 1, 2)
             view.target(3)
+            view.selecting(('easy',))
             view.problem(1, 3, '1', 'Two Sum', 'Easy')
-            view.stage('submitting ...')
+            view.stage('Submitting to LeetCode')
             view.accepted(1)
+            view.next('b')
+            view.set_state('a', 'Waiting')
             view.countdown(90, 120)
             view.clear_countdown()
         self.assertFalse(view.active)
+        output = '\n'.join(lines)
+        for label in ('Now:', 'Problem:', 'Step:', 'Next:', 'Progress:'):
+            self.assertIn(label, output)
+        self.assertIn('a 1/3 Waiting', output)
+        self.assertIn('b 0/2 Waiting', output)
 
     def test_run_view_tracks_progress_without_a_live_region(self):
         view = dashboard.RunView(['default', 'jaagrett'])
@@ -73,10 +84,29 @@ class ViewSelectionTests(unittest.TestCase):
         view.target(6)
         view.accepted(2)
         view.problem(2, 6, '338', 'Counting Bits', 'Easy')
-        view.countdown(462, 700, '· press s to skip')
+        view.countdown(462, 700, '· press s to skip', name='default')
         panel = view._render()
         self.assertEqual((view.done, view.want, view.position), (2, 6, 2))
         self.assertIn('7:42', view.wait)
-        view.stage('submitting ...')
+        self.assertIn('default', view.next_text)
+        view.stage('Submitting to LeetCode')
         self.assertEqual(view.wait, '')
         self.assertIsNotNone(panel)
+
+    @unittest.skipIf(dashboard.Console is None, 'Rich is optional')
+    def test_rich_panel_labels_current_work_and_every_account(self):
+        view = dashboard.RunView(['default', 'jaagrett'])
+        view.targets({'default': 3, 'jaagrett': 2})
+        view.account('jaagrett', 2, 2)
+        view.problem(1, 2, '338', 'Counting Bits', 'Easy')
+        view.stage('Running example tests')
+        view.next('default')
+        console = dashboard.Console(record=True, width=90)
+        console.print(view._render())
+        output = console.export_text()
+        for label in ('Now', 'Problem', 'Step', 'Next', 'Progress'):
+            self.assertIn(label, output)
+        self.assertIn('#338 Counting Bits', output)
+        self.assertIn('Running example tests', output)
+        self.assertIn('default', output)
+        self.assertIn('jaagrett', output)

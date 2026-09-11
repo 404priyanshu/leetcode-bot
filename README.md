@@ -20,8 +20,8 @@ run will use:
 - **Add an account** walks through three steps: a nickname for this computer,
   the LeetCode username to expect, then a confirmation before the browser opens.
   Each answer is checked as you type, and Esc backs out at any step.
-- **Accounts** ticks one login or several with Space; several run one after
-  another, never at the same time.
+- **Accounts** ticks one login or several with Space; several rotate one problem
+  at a time, with only one browser profile active.
 - **Log in again** reopens the browser for the selected account, for a first
   sign-in or an expired session.
 
@@ -40,16 +40,18 @@ rough time range — so nothing starts before you have seen what it involves:
     roughly 38 min – 2 h 8 min
 ```
 
-During the run a panel stays pinned below the log showing the current account
-and its position in the queue, accepted-so-far against the target, the problem
-being worked on, the current step, and a live countdown to the next question.
-Log lines scroll above it. Runs without a terminal — cron and Hermes — keep the
-plain line-per-event output the log files expect.
+During the run a panel stays pinned below the log with explicit **Now**,
+**Problem**, **Step**, **Next**, and per-account **Progress** rows. Eligible
+accounts rotate after each problem attempt. If every unfinished account is in
+its human-paced cooldown, **Next** shows the earliest account and countdown.
+Log lines scroll above it. Runs without a terminal — cron and Hermes — emit the
+same facts as concise labeled phase lines.
 
 The same actions are available as `--account NAME --setup` and
 `--account NAME` for scripted use. The existing account remains `default`, with
-its profile and history unchanged. Hermes can run all accounts sequentially with
-one command; see [three-account setup](windows/README.md#three-accounts-with-hermes).
+its profile and history unchanged. Hermes can run all accounts in the same
+one-problem rotation with one command; see
+[three-account setup](windows/README.md#three-accounts-with-hermes).
 Each account has separate progress and an expected-username check.
 
 ## Requirements

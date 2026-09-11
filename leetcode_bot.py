@@ -60,11 +60,11 @@ ACCOUNT_NAME = "default"
 VIEW = dashboard.NullView()  # replaced by a live panel for interactive runs
 
 STAGE_TEXT = {
-    "Selected": "picking a problem ...",
-    "Solution fetch": "fetching the solution ...",
-    "Problem metadata": "opening the problem ...",
-    "Example tests": "running the example tests ...",
-    "Submission": "submitting ...",
+    "Selected": "Selecting a problem",
+    "Solution fetch": "Fetching solution",
+    "Problem metadata": "Opening problem on LeetCode",
+    "Example tests": "Running example tests",
+    "Submission": "Submitting to LeetCode",
 }
 
 
@@ -1116,7 +1116,7 @@ def setup_telegram():
 
 MENU_HINTS = {
     "start": "Solves and submits to LeetCode using the accounts marked ●.",
-    "accounts": "Pick which logins this run uses. One, or several in turn.",
+    "accounts": "Pick which logins this run uses. Several rotate one problem at a time.",
     "difficulty": "Which difficulties problems are chosen from.",
     "count": "How many accepted solutions to aim for, per account.",
     "timing": "Human-like spreads the work out. Instant does not wait at all.",
@@ -1194,7 +1194,7 @@ def _menu_action(key, cfg, names):
         known = accounts.list_accounts()
         res = checkbox(
             "Run on which accounts?", known, [n in known and n in names for n in known],
-            header=["", dim("  Several accounts run one after another, never at once."), ""],
+            header=["", dim("  Several accounts rotate one problem at a time, never at once."), ""],
         )
         if res:
             return {**cfg, "accounts": [n for n, on in zip(known, res) if on]}
@@ -1268,7 +1268,7 @@ def positive_count(value):
 
 
 def pick_count(cfg):
-    if cfg["count"] is not None:
+    if cfg.get("count") is not None:
         return cfg["count"]
     r = random.random()
     if r < SKIP_DAY_CHANCE:
@@ -1300,7 +1300,7 @@ def _countdown_line(remaining, total, width=20):
     )
 
 
-def _wait_until(deadline):
+def _wait_until(deadline, next_account=None):
     """Wait until a timestamp and show a live countdown in a terminal."""
     remaining = deadline - time.time()
     if remaining <= 0:
@@ -1319,7 +1319,9 @@ def _wait_until(deadline):
                 shown_second = math.ceil(remaining)
                 if shown_second != last_second:
                     if VIEW.active:
-                        VIEW.countdown(remaining, total, "· press s to skip")
+                        VIEW.countdown(
+                            remaining, total, "· press s to skip", name=next_account
+                        )
                     else:
                         sys.stdout.write(
                             "\r\x1b[2K" + dim(_countdown_line(remaining, total))
@@ -1398,6 +1400,8 @@ def wait_for_saved_question_slot(cfg):
 class SessionResult:
     target: int
     done: int = 0
+    attempts: int = 0
+    paced: bool = False
     run_failed: int = 0
     submit_failed: int = 0
     errors: int = 0
@@ -1410,8 +1414,10 @@ class SessionResult:
 def run_session(ctx, cfg, session_id, result):
     page = ctx.new_page()
     source_page = ctx.new_page()
+    VIEW.stage("Opening LeetCode")
     say(dim(f"opening {LEETCODE} ..."))
     navigate(page, LEETCODE)
+    VIEW.stage("Checking signed-in account")
     csrf = verify_login(page)
     say(green("✓ logged in"))
 
@@ -1420,6 +1426,8 @@ def run_session(ctx, cfg, session_id, result):
     # SQLite can recover an accepted ID if the process died before JSON was saved.
     solved = sorted(set(solved) | set(reporting.accepted_problem_ids(HISTORY_DB)))
     want = {d.upper() for d in cfg["difficulties"]}
+    VIEW.selecting(cfg["difficulties"])
+    VIEW.stage("Loading unsolved problem list")
     say(dim(f"fetching problem list ({'/'.join(cfg['difficulties'])}) ..."))
     pool = [q for q in get_problem_list(page)
             if q["difficulty"].upper() in want
@@ -1427,8 +1435,17 @@ def run_session(ctx, cfg, session_id, result):
     say(f"  {len(pool)} problems to pick from · {len(solved)} already solved")
     random.shuffle(pool)
     n = result.target
-    say(bold(f"Today's target: {n} problem{'s' if n != 1 else ''}"))
-    VIEW.target(n)
+    display_target = cfg.get("report_target", n)
+    accepted_before = cfg.get("accepted_before", 0)
+    max_attempts = cfg.get("max_attempts", n + 10)
+    if cfg.get("scheduler_turn"):
+        say(bold(
+            f"Account progress: {accepted_before}/{display_target} accepted"
+            " · this turn attempts one problem"
+        ))
+    else:
+        say(bold(f"Today's target: {n} problem{'s' if n != 1 else ''}"))
+    VIEW.target(display_target)
     log(f"Solving {n} problems, {len(pool)} candidates; timing={cfg['timing']}.")
     attempts = 0
     current_attempt_id = current_attempt_started = None
@@ -1451,22 +1468,25 @@ def run_session(ctx, cfg, session_id, result):
         )
         current_attempt_id = current_attempt_started = None
 
-    while result.done < n and pool and attempts < n + 10:
-        wait_for_saved_question_slot(cfg)
+    while result.done < n and pool and attempts < max_attempts:
+        if not cfg.get("scheduler_turn"):
+            wait_for_saved_question_slot(cfg)
         q = pool.pop()
         slug, name = q["titleSlug"], q["title"]
         attempts += 1
+        result.attempts = attempts
         paced_attempt = False
         current_attempt_id, current_attempt_started = reporting.start_attempt(
             HISTORY_DB, session_id, q
         )
         try:
-            stage("Solution fetch")
             say()
             say(bold(f"[{result.done + 1}/{n}] #{q['frontendQuestionId']} {name}"
                      f" · {q['difficulty'].title()}"))
-            VIEW.problem(result.done + 1, n, q["frontendQuestionId"], name,
+            VIEW.problem(accepted_before + result.done + 1, display_target,
+                         q["frontendQuestionId"], name,
                          q["difficulty"].title())
+            stage("Solution fetch")
             say(dim("  fetching solution from walkccc.me ..."))
             code = get_python_solution(source_page, q["frontendQuestionId"])
             stage("Problem metadata")
@@ -1513,7 +1533,13 @@ def run_session(ctx, cfg, session_id, result):
                     finish_current("Accepted", status_message=status_message,
                                    runtime=rt, submission_id=submission_id)
                     result.done += 1
-                    VIEW.accepted(result.done)
+                    VIEW.accepted(accepted_before + result.done)
+                    if (not cfg.get("scheduler_turn")
+                            and result.done < display_target):
+                        VIEW.next(
+                            ACCOUNT_NAME,
+                            action=f"{ACCOUNT_NAME} · select another unsolved problem",
+                        )
                     result.accepted.append(name)
                     solved.append(str(q["frontendQuestionId"]))
                     save_solved(solved)
@@ -1564,7 +1590,9 @@ def run_session(ctx, cfg, session_id, result):
             log(f"{outcome.upper()} on {name}: {error}")
             say(red(f"  ✗ {outcome.lower()}: {error}"))
 
-        if paced_attempt and result.done < n and pool and attempts < n + 10:
+        result.paced = result.paced or paced_attempt
+        if (not cfg.get("scheduler_turn") and paced_attempt and result.done < n
+                and pool and attempts < max_attempts):
             wait_before_next_question(cfg)
 
     if result.done < n:
@@ -1577,22 +1605,37 @@ def execute_session(cfg):
     """Own the entire run lifecycle, including startup failures and cleanup."""
     t0 = time.monotonic()
     cleanup_failed = False
-    result = SessionResult(target=pick_count(cfg))
+    session_target = cfg.get("session_target")
+    result = SessionResult(
+        target=session_target if session_target is not None else pick_count(cfg)
+    )
+    if not cfg.get("scheduler_turn"):
+        VIEW.targets({ACCOUNT_NAME: result.target})
+        VIEW.account(ACCOUNT_NAME, 1, 1)
+        VIEW.next(
+            ACCOUNT_NAME,
+            action=f"{ACCOUNT_NAME} · select its first unsolved problem",
+        )
     reporting.recover_interrupted_sessions(HISTORY_DB)
     session_id = reporting.start_session(
-        HISTORY_DB, cfg["difficulties"], cfg["timing"], result.target
+        HISTORY_DB, cfg["difficulties"], cfg["timing"],
+        cfg.get("report_target", result.target),
     )
     try:
         ensure_api_circuit_closed()
-        if not cfg["interactive"] and cfg["timing"] == "human" and not cfg.get("skip_start_jitter", False):
+        if (not cfg["interactive"] and cfg["timing"] == "human"
+                and not cfg.get("skip_start_jitter", False)
+                and not cfg.get("scheduler_turn")):
             jitter = random.uniform(0, START_JITTER_HOURS * 3600)
             say(dim(f"start jitter: sleeping {jitter / 60:.0f} min ..."))
             _wait_until(time.time() + jitter)
         with sync_playwright() as p:
+            VIEW.stage("Opening browser profile")
             ctx = _launch(p, offscreen=not cfg.get("visible_browser", False))
             try:
                 run_session(ctx, cfg, session_id, result)
             finally:
+                VIEW.stage("Closing browser profile")
                 try:
                     ctx.close()
                 except Exception as error:
@@ -1614,11 +1657,20 @@ def execute_session(cfg):
         result.reason = str(error)
     finally:
         reporting.finish_session(HISTORY_DB, session_id, result.status, result.reason)
+        VIEW.stage("Updating account report")
         refresh_excel_report()
 
     mins = (time.monotonic() - t0) / 60
     say()
-    say(bold(f"Session done — {result.done}/{result.target} accepted · {result.status}"))
+    if cfg.get("scheduler_turn"):
+        aggregate_done = cfg.get("accepted_before", 0) + result.done
+        aggregate_target = cfg.get("report_target", result.target)
+        say(bold(
+            f"Turn done — {aggregate_done}/{aggregate_target} accepted"
+            f" · {result.status}"
+        ))
+    else:
+        say(bold(f"Session done — {result.done}/{result.target} accepted · {result.status}"))
     if result.reason:
         say(yellow(f"  {reporting.clean_reason(result.reason)}"))
         log(f"{result.status}: {result.reason}")
@@ -1636,8 +1688,14 @@ def execute_session(cfg):
     msg.append(f"{mins:.0f} min total")
     send_telegram("\n".join(msg))
     if cfg.get("batch_child") and (cleanup_failed or result.status in ("Rate limited", "Network error")):
-        return 75
-    return 0 if result.status == "Completed" else (130 if result.status == "Interrupted" else 1)
+        code = 75
+    else:
+        code = 0 if result.status == "Completed" else (130 if result.status == "Interrupted" else 1)
+    if not cfg.get("scheduler_turn"):
+        VIEW.accepted(result.done)
+        VIEW.set_state(ACCOUNT_NAME, "Done" if code == 0 else "Failed")
+        VIEW.complete(stopped=code != 0)
+    return (code, result) if cfg.get("return_result") else code
 
 
 def load_solved():
@@ -1695,18 +1753,36 @@ def main():
     )
     ap.add_argument("--visible-browser", action="store_true",
                     help="keep the headed Chrome window on screen on Windows")
-    ap.add_argument("--account", default="default", help="named account (default: existing account)")
+    selection = ap.add_mutually_exclusive_group()
+    selection.add_argument("--account", default="default",
+                           help="named account (default: existing account)")
+    selection.add_argument("--accounts", nargs="+",
+                           help="named accounts to rotate one problem at a time")
     ap.add_argument("--skip-start-jitter", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--batch-child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     try:
-        configure_account(args.account)
+        names = args.accounts or [args.account]
+        if len(set(names)) != len(names):
+            raise ValueError("Each account may appear only once in a batch.")
+        if args.setup and args.accounts:
+            raise ValueError("Set up one account at a time with --account NAME --setup.")
+        configure_account(names[0])
         if not args.setup:
-            accounts.expected_username(args.account)
+            for name in names:
+                accounts.expected_username(name)
         # The menu can switch accounts, so it runs before any account is locked.
         if wants_menu(args):
             return run_interactive(args)
+        if len(names) > 1:
+            cfg = {**session_config(args), "accounts": names}
+            if args.batch_child:
+                return run_accounts(cfg)
+            batch_lock = accounts.storage_root() / ".batch.lock"
+            batch_lock.parent.mkdir(parents=True, exist_ok=True)
+            with exclusive_run(batch_lock):
+                return run_accounts(cfg)
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_run(LOCK_FILE):
             return run_command(args)
@@ -1722,7 +1798,7 @@ def main():
 
 
 def session_config(args):
-    return {
+    cfg = {
         "difficulties": args.difficulty or ("easy",),
         "count": args.count,
         "timing": "instant" if args.instant else "human",
@@ -1731,6 +1807,9 @@ def session_config(args):
         "skip_start_jitter": getattr(args, "skip_start_jitter", False),
         "batch_child": getattr(args, "batch_child", False),
     }
+    if getattr(args, "accounts", None):
+        cfg["accounts"] = list(args.accounts)
+    return cfg
 
 
 def wants_menu(args):
@@ -1740,6 +1819,7 @@ def wants_menu(args):
         and not args.no_menu
         and sys.stdin.isatty()
         and sys.stdout.isatty()
+        and not getattr(args, "accounts", None)
         and not (args.count or args.instant or args.difficulty)
     )
 
@@ -1790,11 +1870,289 @@ def report_batch(results):
         announce(f"  {name.ljust(width)}  {label}")
 
 
+@dataclass
+class AccountRunState:
+    name: str
+    target: int
+    accepted: int = 0
+    attempts: int = 0
+    next_eligible_at: float = 0
+    state: str = "Waiting"
+    code: int | None = None
+    reason: str = ""
+
+
+@dataclass
+class TurnOutcome:
+    code: int
+    accepted: int = 0
+    attempted: bool = True
+    paced: bool = False
+    status: str = "Completed"
+    reason: str = ""
+
+
+def run_one_account_turn(name, cfg, target):
+    """Run at most one problem attempt while holding only this account's lock."""
+    configure_account(name)
+    accounts.expected_username(name)
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    turn_cfg = {
+        **cfg,
+        "count": 1,
+        "session_target": 1,
+        "max_attempts": 1,
+        "report_target": target,
+        "accepted_before": cfg.get("accepted_before", 0),
+        "scheduler_turn": True,
+        "return_result": True,
+        "batch_child": True,
+        "skip_start_jitter": True,
+    }
+    with exclusive_run(LOCK_FILE):
+        code, result = execute_session(turn_cfg)
+    return TurnOutcome(
+        code=code,
+        accepted=result.done,
+        attempted=result.attempts > 0,
+        paced=result.paced,
+        status=result.status,
+        reason=result.reason,
+    )
+
+
+def _account_deadline(name, timing):
+    configure_account(name)
+    if timing != "human":
+        if "next_question_at" in load_runtime_state():
+            update_runtime_state(next_question_at=None)
+        return 0
+    return _state_float(load_runtime_state().get("next_question_at"))
+
+
+def _save_account_deadline(name, deadline):
+    configure_account(name)
+    update_runtime_state(next_question_at=deadline or None)
+
+
+def _next_eligible_in_rotation(states, start, now, exclude=None):
+    """Find the next eligible unfinished account in circular order."""
+    for offset in range(len(states)):
+        index = (start + offset) % len(states)
+        state = states[index]
+        if (state is not exclude
+                and state.state not in ("Done", "Failed", "Skipped")
+                and state.next_eligible_at <= now):
+            return index
+    return None
+
+
+def _earliest_in_rotation(states, start, exclude=None):
+    """Find the earliest deadline, using circular order to break ties."""
+    candidates = []
+    for offset in range(len(states)):
+        state = states[(start + offset) % len(states)]
+        if (state is not exclude
+                and state.state not in ("Done", "Failed", "Skipped")):
+            candidates.append(state)
+    return min(candidates, key=lambda state: state.next_eligible_at)
+
+
+def _show_next_after_turn(view, states, cursor, now, active):
+    """Describe the best known next action while one account is running."""
+    next_index = _next_eligible_in_rotation(states, cursor, now, exclude=active)
+    if next_index is not None:
+        view.next(states[next_index].name)
+        return
+    others = [
+        state for state in states
+        if state is not active and state.state not in ("Done", "Failed", "Skipped")
+    ]
+    if others:
+        earliest = _earliest_in_rotation(states, cursor, exclude=active)
+        remaining = max(0, earliest.next_eligible_at - now)
+        view.next(
+            earliest.name,
+            action=f"{earliest.name} when eligible ({_format_countdown(remaining)})",
+        )
+    else:
+        view.next(
+            active.name,
+            action="After this turn: finish or select this account's next problem",
+        )
+
+
+def _mark_shared_stop(states, active, code, reason, view):
+    """Stop one account and mark every other unfinished account as not runnable."""
+    active.state, active.code, active.reason = "Failed", code, reason
+    view.set_state(active.name, "Failed", emit=False)
+    for other in states:
+        if other is not active and other.state not in ("Done", "Failed", "Skipped"):
+            other.state, other.code = "Skipped", None
+            view.set_state(other.name, "Failed", emit=False)
+    view.show_progress()
+
+
+def run_account_queue(cfg, names, view, turn_runner=run_one_account_turn,
+                      clock=time.time, waiter=None, gap_picker=None):
+    """Run one account problem at a time using an eligibility-aware rotation."""
+    gap_picker = gap_picker or (lambda: random.uniform(MIN_GAP, MAX_GAP) * 60)
+    states = [
+        AccountRunState(
+            name=name,
+            target=pick_count(cfg),
+            next_eligible_at=_account_deadline(name, cfg["timing"]),
+        )
+        for name in names
+    ]
+    view.targets({state.name: state.target for state in states})
+    stopped_code = None
+
+    if (not cfg.get("interactive") and cfg["timing"] == "human"
+            and not cfg.get("skip_start_jitter", False)):
+        jitter = random.uniform(0, START_JITTER_HOURS * 3600)
+        deadline = clock() + jitter
+        first_index = _next_eligible_in_rotation(states, 0, deadline)
+        first = (states[first_index] if first_index is not None
+                 else _earliest_in_rotation(states, 0))
+        view.waiting(first.name)
+        view.next(
+            first.name,
+            action=f"Begin with {first.name} after startup delay ({_format_countdown(jitter)})",
+        )
+        announce(dim(
+            f"Startup delay: {_format_countdown(jitter)}; then {first.name}"
+        ))
+        try:
+            if waiter is None:
+                _wait_until(deadline, next_account=first.name)
+            else:
+                waiter(deadline)
+        except KeyboardInterrupt:
+            stopped_code = 130
+            _mark_shared_stop(states, states[0], 130, "Stopped by user", view)
+
+    cursor = 0
+    while stopped_code is None:
+        unfinished = [s for s in states if s.state not in ("Done", "Failed", "Skipped")]
+        if not unfinished:
+            break
+
+        now = clock()
+        eligible_index = None
+        for offset in range(len(states)):
+            index = (cursor + offset) % len(states)
+            state = states[index]
+            if (state.state not in ("Done", "Failed", "Skipped")
+                    and state.next_eligible_at <= now):
+                eligible_index = index
+                break
+
+        if eligible_index is None:
+            earliest = _earliest_in_rotation(states, cursor)
+            remaining = max(0, earliest.next_eligible_at - now)
+            view.waiting(earliest.name)
+            view.next(earliest.name, remaining)
+            try:
+                skipped = (
+                    _wait_until(earliest.next_eligible_at, next_account=earliest.name)
+                    if waiter is None else waiter(earliest.next_eligible_at)
+                )
+            except KeyboardInterrupt:
+                stopped_code = 130
+                _mark_shared_stop(
+                    states, earliest, 130, "Stopped by user", view
+                )
+                break
+            if skipped:
+                earliest.next_eligible_at = 0
+                _save_account_deadline(earliest.name, 0)
+            continue
+
+        state = states[eligible_index]
+        cursor = (eligible_index + 1) % len(states)
+        state.state = "Running"
+        _save_account_deadline(state.name, 0)
+        view.account(state.name, eligible_index + 1, len(states))
+        view.target(state.target)
+        view.accepted(state.accepted)
+        view.selecting(cfg["difficulties"])
+        view.stage("Opening browser profile")
+        _show_next_after_turn(view, states, cursor, now, state)
+
+        try:
+            outcome = turn_runner(
+                state.name, {**cfg, "accepted_before": state.accepted}, state.target
+            )
+        except KeyboardInterrupt:
+            outcome = TurnOutcome(
+                code=130, attempted=False, status="Interrupted",
+                reason="Stopped by user",
+            )
+        except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:
+            outcome = TurnOutcome(code=1, attempted=False, status="Failed", reason=str(error))
+            say(red(f"✗ {error}"))
+
+        state.accepted += outcome.accepted
+        state.attempts += int(outcome.attempted)
+        view.accepted(state.accepted)
+        if outcome.code in (75, 130) or outcome.code < 0:
+            stopped_code = outcome.code
+            _mark_shared_stop(
+                states, state, outcome.code, outcome.reason, view
+            )
+            break
+        if state.accepted >= state.target:
+            state.state, state.code = "Done", 0
+            view.set_state(state.name, "Done")
+            continue
+
+        retryable = (
+            outcome.attempted
+            and outcome.status == "Partial"
+            and state.attempts < state.target + 10
+        )
+        if outcome.code == 0 or retryable:
+            state.state = "Waiting"
+            if cfg["timing"] == "human" and outcome.paced:
+                state.next_eligible_at = clock() + gap_picker()
+                _save_account_deadline(state.name, state.next_eligible_at)
+            else:
+                state.next_eligible_at = 0
+            view.set_state(state.name, "Waiting")
+        else:
+            state.state, state.code, state.reason = "Failed", 1, outcome.reason
+            view.set_state(state.name, "Failed")
+
+    view.complete(stopped=stopped_code is not None)
+    results = []
+    for state in states:
+        if state.state == "Done":
+            label, code = green("completed"), 0
+        elif state.state == "Skipped":
+            label, code = yellow("skipped — shared stop"), None
+        else:
+            detail = f": {reporting.clean_reason(state.reason)}" if state.reason else ""
+            label, code = red(f"failed{detail}"), state.code or 1
+        results.append((state.name, code, label))
+    report_batch(results)
+    if stopped_code == 130:
+        return 130
+    return 0 if all(state.state == "Done" for state in states) else 1
+
+
 def run_accounts(cfg):
     """Run the chosen accounts in turn, holding one account's lock at a time."""
     global VIEW
+    cfg = {
+        "difficulties": ("easy",),
+        "count": None,
+        "timing": "instant",
+        "interactive": False,
+        **cfg,
+    }
     names = cfg.get("accounts") or [ACCOUNT_NAME]
-    view = dashboard.build(names) if cfg.get("interactive") else dashboard.NullView()
+    view = dashboard.build(names)
     previous, VIEW = VIEW, view
     try:
         with view:
@@ -1805,33 +2163,10 @@ def run_accounts(cfg):
 
 def _run_accounts(cfg, names, view):
     if len(names) == 1:
-        view.account(names[0], 1, 1)
         return run_one_account(names[0], cfg)
-    announce(bold(f"Running {len(names)} accounts, one after another: {', '.join(names)}"))
-    announce(dim("Each finishes its own problems before the next one starts."))
-    results, stopped = [], ""
-    for position, name in enumerate(names, 1):
-        if stopped:
-            results.append((name, None, yellow(f"skipped — {stopped}")))
-            continue
-        announce("")
-        announce(bold(f"─── {position}/{len(names)} · {name} ───"))
-        view.account(name, position, len(names))
-        try:
-            code = run_one_account(name, {**cfg, "batch_child": True})
-        except (AlreadyRunning, ValueError, OSError, RuntimeError) as error:
-            say(red(f"✗ {error}"))
-            code = 1
-        results.append((name, code, outcome_label(code)))
-        # A shared failure or an interruption stops the remaining accounts.
-        if code == 130:
-            stopped = "you stopped the run"
-        elif code == 75:
-            stopped = f"{name} hit a shared block"
-    report_batch(results)
-    if any(code == 130 for _, code, _ in results):
-        return 130
-    return 0 if all(code == 0 for _, code, _ in results) else 1
+    announce(bold(f"Running {len(names)} accounts in a one-problem rotation: {', '.join(names)}"))
+    announce(dim("Only one browser profile runs at a time; eligible accounts alternate."))
+    return run_account_queue(cfg, names, view)
 
 
 def run_one_account(name, cfg):
